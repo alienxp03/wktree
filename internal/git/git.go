@@ -38,7 +38,14 @@ type ListedWorktree struct {
 type RemoveOptions struct {
 	Branch string
 	Cwd    string
+	Force  bool
 	Runner run.Runner
+}
+
+type RemoveTarget struct {
+	Branch       string
+	RepoRoot     string
+	WorktreePath string
 }
 
 type CreateOptions struct {
@@ -263,50 +270,66 @@ func SwitchWorktree(ctx context.Context, target SwitchTarget, runner run.Runner)
 	return target.Worktree, nil
 }
 
-func RemoveWorktree(ctx context.Context, options RemoveOptions) error {
+func ResolveRemoveTarget(ctx context.Context, options RemoveOptions) (RemoveTarget, error) {
 	runner := options.Runner
 	if runner == nil {
 		runner = run.DefaultRunner{}
 	}
 	branch := paths.StripOriginPrefix(options.Branch)
 	if branch == "" {
-		return fmt.Errorf("branch name is required")
+		return RemoveTarget{}, fmt.Errorf("branch name is required")
 	}
 
 	repoRoot, err := RepoRoot(ctx, options.Cwd, runner)
 	if err != nil {
-		return err
+		return RemoveTarget{}, err
 	}
 	if err := ensureBranchName(ctx, repoRoot, branch, runner); err != nil {
-		return err
+		return RemoveTarget{}, err
 	}
 	if exists, err := refExists(ctx, repoRoot, "refs/heads/"+branch, runner); err != nil {
-		return err
+		return RemoveTarget{}, err
 	} else if !exists {
-		return fmt.Errorf("local branch does not exist: %s", branch)
+		return RemoveTarget{}, fmt.Errorf("local branch does not exist: %s", branch)
 	}
 
 	worktreePath, ok, err := checkedOutWorktree(ctx, repoRoot, branch, runner)
 	if err != nil {
-		return err
+		return RemoveTarget{}, err
 	}
 	if !ok {
-		return fmt.Errorf("branch has no worktree: %s", branch)
+		return RemoveTarget{}, fmt.Errorf("branch has no worktree: %s", branch)
 	}
 	if samePath(repoRoot, worktreePath) {
-		return fmt.Errorf("cannot remove current worktree: %s", branch)
+		return RemoveTarget{}, fmt.Errorf("cannot remove current worktree: %s", branch)
 	}
-	if err := ensureBranchMerged(ctx, repoRoot, branch, runner); err != nil {
-		return err
+	if !options.Force {
+		if err := ensureBranchMerged(ctx, repoRoot, branch, runner); err != nil {
+			return RemoveTarget{}, err
+		}
 	}
+	return RemoveTarget{Branch: branch, RepoRoot: repoRoot, WorktreePath: worktreePath}, nil
+}
 
-	removeArgs := []string{"worktree", "remove", worktreePath}
-	removed := runGit(ctx, runner, repoRoot, removeArgs, false)
+func RemoveWorktree(ctx context.Context, target RemoveTarget, force bool, runner run.Runner) error {
+	if runner == nil {
+		runner = run.DefaultRunner{}
+	}
+	removeArgs := []string{"worktree", "remove"}
+	if force {
+		removeArgs = append(removeArgs, "--force")
+	}
+	removeArgs = append(removeArgs, target.WorktreePath)
+	removed := runGit(ctx, runner, target.RepoRoot, removeArgs, false)
 	if removed.Err != nil || removed.ExitCode != 0 {
 		return errors.New(run.FailureMessage("git", removeArgs, removed))
 	}
-	deleteArgs := []string{"branch", "-d", branch}
-	deleted := runGit(ctx, runner, repoRoot, deleteArgs, false)
+	deleteArgs := []string{"branch", "-d"}
+	if force {
+		deleteArgs = []string{"branch", "-D"}
+	}
+	deleteArgs = append(deleteArgs, target.Branch)
+	deleted := runGit(ctx, runner, target.RepoRoot, deleteArgs, false)
 	if deleted.Err != nil || deleted.ExitCode != 0 {
 		return errors.New(run.FailureMessage("git", deleteArgs, deleted))
 	}

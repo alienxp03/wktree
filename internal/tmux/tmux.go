@@ -35,6 +35,30 @@ func Open(ctx context.Context, options Options) (int, error) {
 	return openSession(ctx, runner, options)
 }
 
+func KillSessionForWorktree(ctx context.Context, worktreePath string, runner run.Runner) error {
+	if runner == nil {
+		runner = run.DefaultRunner{}
+	}
+	if err := ensureAvailable(ctx, runner); err != nil {
+		return nil
+	}
+	sessionName := SessionName(worktreePath)
+	hasSessionArgs := []string{"has-session", "-t", sessionName}
+	hasSession := runTmux(ctx, runner, hasSessionArgs, true, false)
+	if hasSession.ExitCode == 1 {
+		return nil
+	}
+	if hasSession.ExitCode != 0 {
+		return errors.New(run.FailureMessage("tmux", hasSessionArgs, hasSession))
+	}
+	killArgs := []string{"kill-session", "-t", sessionName}
+	killed := runTmux(ctx, runner, killArgs, false, false)
+	if killed.Err != nil || killed.ExitCode != 0 {
+		return errors.New(run.FailureMessage("tmux", killArgs, killed))
+	}
+	return nil
+}
+
 func SessionName(worktreePath string) string {
 	current := pathNameComponent(filepath.Base(filepath.Clean(worktreePath)))
 	parent := pathNameComponent(filepath.Base(filepath.Dir(filepath.Clean(worktreePath))))

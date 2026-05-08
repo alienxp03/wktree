@@ -36,6 +36,7 @@ wktree list
 wktree new feature/example
 wktree switch feature/example
 wktree remove feature/example
+wktree remove --force feature/example
 wktree new --tmux feature/example
 wktree switch --tmux feature/example
 wktree new --home /tmp/worktrees feature/example
@@ -45,7 +46,7 @@ wktree new --home /tmp/worktrees feature/example
 
 `wktree switch <branch>` opens an existing branch worktree. If the branch exists but has no worktree yet, it creates one. If only `origin/<branch>` exists, it creates a local tracking branch and worktree. If the branch already has a worktree, it reuses that path.
 
-`wktree remove <branch>` removes the branch worktree and then deletes the local branch with Git's safe branch deletion rules. It does not remove remote branches or force-delete unmerged work.
+`wktree remove <branch>` kills the matching tmux session if it exists, removes the branch worktree, and then deletes the local branch with Git's safe branch deletion rules. It does not remove remote branches. Use `--force` to remove a dirty worktree and force-delete the local branch.
 
 `wktree list` shows every Git worktree for the current repository, including the primary checkout.
 
@@ -148,6 +149,6 @@ Inside tmux, wktree switches the current client to the new session. Outside tmux
 - `local branch already exists`: choose a branch name that does not exist locally.
 - `origin branch already exists`: fetches or remote refs already include that branch.
 - `branch does not exist locally or on origin`: use `wktree new <branch>` to create a new branch.
-- `branch is not merged into current HEAD`: merge the branch or remove it manually with Git if you really want to force deletion.
+- `branch is not merged into current HEAD`: merge the branch or use `wktree remove --force <branch>` if you really want to delete it.
 - `target worktree path already exists`: remove or rename the existing directory, or use `--home`.
 - `tmux ... failed`: install tmux or choose a branch name that produces a non-conflicting tmux target.

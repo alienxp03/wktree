@@ -183,6 +183,41 @@ func TestWktreeRemoveRejectsCurrentWorktree(t *testing.T) {
 	}
 }
 
+func TestWktreeRemoveForceDeletesUnmergedBranch(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	env := testEnv(repo.root)
+	sourceBranch := git(t, []string{"branch", "--show-current"}, repo.sourceRoot)
+
+	git(t, []string{"checkout", "-b", "feature/unmerged"}, repo.sourceRoot)
+	write(t, filepath.Join(repo.sourceRoot, "unmerged.txt"), "unmerged\n")
+	git(t, []string{"add", "unmerged.txt"}, repo.sourceRoot)
+	git(t, []string{"commit", "-m", "Unmerged commit"}, repo.sourceRoot)
+	git(t, []string{"checkout", sourceBranch}, repo.sourceRoot)
+
+	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "--no-setup", "--no-cd", "feature/unmerged"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("switch status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03_demo_feature-unmerged")
+
+	result = runWktree(t, binary, []string{"remove", "feature/unmerged"}, repo.sourceRoot, env)
+	if result.exitCode == 0 || !strings.Contains(result.stderr, "branch is not merged into current HEAD") {
+		t.Fatalf("expected unmerged error, status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+
+	result = runWktree(t, binary, []string{"remove", "--force", "feature/unmerged"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("force remove status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
+		t.Fatalf("expected worktree removed, stat err=%v", err)
+	}
+	if got := git(t, []string{"branch", "--list", "feature/unmerged"}, repo.sourceRoot); got != "" {
+		t.Fatalf("branch still exists: %q", got)
+	}
+}
+
 func TestWktreeCompletesSwitchBranches(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)

@@ -143,6 +143,36 @@ func TestOpenFailsWhenNewSessionDoesNotReturnPane(t *testing.T) {
 	}
 }
 
+func TestKillSessionForWorktree(t *testing.T) {
+	runner := newTmuxRunner(t)
+	runner.hasSession = true
+
+	err := KillSessionForWorktree(context.Background(), "/tmp/me/testing_name", run.RunnerFunc(runner.run))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := firstArgs(runner.calls)
+	want := []string{"-V", "has-session", "kill-session"}
+	assertSlice(t, got, want)
+	if runner.calls[2].args[2] != "me/testing_name" {
+		t.Fatalf("kill-session args = %#v", runner.calls[2].args)
+	}
+}
+
+func TestKillSessionForWorktreeSkipsMissingSession(t *testing.T) {
+	runner := newTmuxRunner(t)
+
+	err := KillSessionForWorktree(context.Background(), "/tmp/me/testing_name", run.RunnerFunc(runner.run))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := firstArgs(runner.calls)
+	want := []string{"-V", "has-session"}
+	assertSlice(t, got, want)
+}
+
 type tmuxCall struct {
 	command string
 	args    []string

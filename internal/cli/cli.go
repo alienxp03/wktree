@@ -112,15 +112,47 @@ func runList(ctx context.Context, args []string, options Options) (int, error) {
 }
 
 func runRemove(ctx context.Context, args []string, options Options) (int, error) {
-	if len(args) != 1 {
-		return 1, fmt.Errorf("usage: wktree remove <branch>")
-	}
-	branch := args[0]
-	if err := git.RemoveWorktree(ctx, git.RemoveOptions{Branch: branch, Cwd: options.Cwd, Runner: options.Runner}); err != nil {
+	parsed, err := parseRemoveArgs(args)
+	if err != nil {
 		return 1, err
 	}
-	fmt.Fprintf(options.Stdout, "removed %s\n", strings.TrimPrefix(branch, "origin/"))
+	target, err := git.ResolveRemoveTarget(ctx, git.RemoveOptions{Branch: parsed.Branch, Cwd: options.Cwd, Force: parsed.Force, Runner: options.Runner})
+	if err != nil {
+		return 1, err
+	}
+	if err := tmux.KillSessionForWorktree(ctx, target.WorktreePath, options.Runner); err != nil {
+		return 1, err
+	}
+	if err := git.RemoveWorktree(ctx, target, parsed.Force, options.Runner); err != nil {
+		return 1, err
+	}
+	fmt.Fprintf(options.Stdout, "removed %s\n", target.Branch)
 	return 0, nil
+}
+
+type removeArgs struct {
+	Branch string
+	Force  bool
+}
+
+func parseRemoveArgs(args []string) (removeArgs, error) {
+	parsed := removeArgs{}
+	positionals := []string{}
+	for _, arg := range args {
+		switch {
+		case arg == "--force" || arg == "-f":
+			parsed.Force = true
+		case strings.HasPrefix(arg, "-"):
+			return removeArgs{}, fmt.Errorf("unknown option: %s", arg)
+		default:
+			positionals = append(positionals, arg)
+		}
+	}
+	if len(positionals) != 1 {
+		return removeArgs{}, fmt.Errorf("usage: wktree remove [--force] <branch>")
+	}
+	parsed.Branch = positionals[0]
+	return parsed, nil
 }
 
 func runNew(ctx context.Context, args []string, options Options) (int, error) {
@@ -390,7 +422,7 @@ Usage:
   wktree --version
   wktree list
   wktree new [--tmux] [--home <path>] [--no-cd] [--no-setup] <branch>
-  wktree remove <branch>
+  wktree remove [--force] <branch>
   wktree switch [--tmux] [--home <path>] [--no-cd] [--no-setup] <branch>
   wktree init zsh
   wktree init bash
