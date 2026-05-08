@@ -1,0 +1,106 @@
+package paths
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+)
+
+var (
+	slashOrWhitespace = regexp.MustCompile(`[\/\s]+`)
+	unsafePathChars   = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+	repeatedDash      = regexp.MustCompile(`-+`)
+	githubRemotes     = []*regexp.Regexp{
+		regexp.MustCompile(`^https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$`),
+		regexp.MustCompile(`^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?/?$`),
+		regexp.MustCompile(`^ssh://git@github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$`),
+	}
+)
+
+func StripOriginPrefix(branch string) string {
+	return strings.TrimPrefix(branch, "origin/")
+}
+
+func BranchSlug(branch string) (string, error) {
+	slug := StripOriginPrefix(branch)
+	slug = slashOrWhitespace.ReplaceAllString(slug, "-")
+	slug = unsafePathChars.ReplaceAllString(slug, "-")
+	slug = repeatedDash.ReplaceAllString(slug, "-")
+	slug = strings.Trim(slug, "-_.")
+	if slug == "" {
+		return "", fmt.Errorf("branch cannot produce a non-empty path slug")
+	}
+	return slug, nil
+}
+
+func ParseGitHubRemote(remoteURL string) (string, bool, error) {
+	value := strings.TrimSpace(remoteURL)
+	for _, pattern := range githubRemotes {
+		matches := pattern.FindStringSubmatch(value)
+		if matches == nil {
+			continue
+		}
+		org, err := PathSlugPart(matches[1])
+		if err != nil {
+			return "", false, err
+		}
+		repo, err := PathSlugPart(matches[2])
+		if err != nil {
+			return "", false, err
+		}
+		return org + "_" + repo, true, nil
+	}
+	return "", false, nil
+}
+
+func RepoDirectorySlug(repoRoot string) (string, error) {
+	parent, err := PathSlugPart(filepath.Base(filepath.Dir(repoRoot)))
+	if err != nil {
+		return "", err
+	}
+	repo, err := PathSlugPart(filepath.Base(repoRoot))
+	if err != nil {
+		return "", err
+	}
+	return parent + "_" + repo, nil
+}
+
+func PathSlugPart(value string) (string, error) {
+	slug := strings.TrimSuffix(value, ".git")
+	slug = unsafePathChars.ReplaceAllString(slug, "-")
+	slug = repeatedDash.ReplaceAllString(slug, "-")
+	slug = strings.Trim(slug, "-_.")
+	if slug == "" {
+		return "", fmt.Errorf("value cannot produce a non-empty path slug")
+	}
+	return slug, nil
+}
+
+func WorktreeHome(homeOption string) (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	configured := homeOption
+	if configured == "" {
+		configured = filepath.Join(homeDir, "workspace", "worktrees")
+	}
+	expanded := ExpandHome(configured, homeDir)
+	return filepath.Abs(expanded)
+}
+
+func ExpandHome(input string, homeDir string) string {
+	if input == "~" {
+		return homeDir
+	}
+	if strings.HasPrefix(input, "~/") {
+		return filepath.Join(homeDir, input[2:])
+	}
+	return input
+}
+
+func WorktreePath(worktreeHome string, repoSlug string, branchSlug string) string {
+	return filepath.Join(worktreeHome, repoSlug+"_"+branchSlug)
+}

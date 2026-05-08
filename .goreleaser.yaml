@@ -1,0 +1,37 @@
+version: 2
+
+project_name: wktree
+
+builds:
+  - id: wktree
+    main: ./cmd/wktree
+    binary: wktree
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+brews:
+  - name: wktree
+    repository:
+      owner: alienxp03
+      name: homebrew-tap
+    directory: Formula
+    homepage: "https://github.com/alienxp03/wktree"
+    description: "Create strict Git worktrees with optional shell and tmux setup"
+    license: MIT
+    test: |
+      system "#{bin}/wktree", "--version"
