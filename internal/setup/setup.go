@@ -3,12 +3,14 @@ package setup
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/alienxp03/wktree/internal/config"
@@ -16,11 +18,20 @@ import (
 )
 
 type Plan struct {
-	RepoRoot     string   `json:"repoRoot"`
-	WorktreePath string   `json:"worktreePath"`
-	Copy         []string `json:"copy"`
-	Symlink      []string `json:"symlink"`
-	PostSetup    []string `json:"postSetup"`
+	RepoRoot            string
+	WorktreePath        string
+	WorkspaceName       string
+	Branch              string
+	Copy                []string
+	Symlink             []string
+	RandomizePorts      []config.RandomizePort
+	PreserveRandomPorts bool
+	PostCreate          []string
+	Context             Context
+}
+
+type Context struct {
+	WorkspacePaths map[string]string
 }
 
 type Logger struct {
@@ -58,64 +69,32 @@ func (DefaultShellRunner) RunShell(ctx context.Context, command string, cwd stri
 	return shellResult(err, stdout.String(), stderr.String())
 }
 
-func NewPlan(repoRoot string, worktreePath string, setupConfig config.Config) Plan {
+func NewPlan(repoRoot string, worktreePath string, workspaceName string, branch string, files config.Files, hooks config.Hooks, randomizePorts []config.RandomizePort, preserveRandomPorts bool, context Context) Plan {
 	return Plan{
-		RepoRoot:     repoRoot,
-		WorktreePath: worktreePath,
-		Copy:         append([]string(nil), setupConfig.Copy...),
-		Symlink:      append([]string(nil), setupConfig.Symlink...),
-		PostSetup:    append([]string(nil), setupConfig.PostSetup...),
+		RepoRoot:            repoRoot,
+		WorktreePath:        worktreePath,
+		WorkspaceName:       workspaceName,
+		Branch:              branch,
+		Copy:                append([]string(nil), files.Copy...),
+		Symlink:             append([]string(nil), files.Symlink...),
+		RandomizePorts:      append([]config.RandomizePort(nil), randomizePorts...),
+		PreserveRandomPorts: preserveRandomPorts,
+		PostCreate:          append([]string(nil), hooks.PostCreate...),
+		Context:             context,
 	}
-}
-
-func WritePlan(filePath string, plan Plan) error {
-	data, err := json.Marshal(plan)
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return os.WriteFile(filePath, data, 0o600)
-}
-
-func ReadPlan(filePath string) (Plan, error) {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return Plan{}, err
-	}
-	var plan Plan
-	if err := json.Unmarshal(data, &plan); err != nil {
-		return Plan{}, err
-	}
-	if err := ValidatePlan(plan, filePath); err != nil {
-		return Plan{}, err
-	}
-	return plan, nil
-}
-
-func ValidatePlan(plan Plan, filePath string) error {
-	if strings.TrimSpace(plan.RepoRoot) == "" {
-		return fmt.Errorf("invalid setup plan in %s: repoRoot is required", filePath)
-	}
-	if strings.TrimSpace(plan.WorktreePath) == "" {
-		return fmt.Errorf("invalid setup plan in %s: worktreePath is required", filePath)
-	}
-	if err := validateRelativePaths(plan.Copy, "copy", filePath); err != nil {
-		return err
-	}
-	if err := validateRelativePaths(plan.Symlink, "symlink", filePath); err != nil {
-		return err
-	}
-	if err := validateNonEmpty(plan.PostSetup, "postSetup", filePath); err != nil {
-		return err
-	}
-	return nil
 }
 
 func Run(ctx context.Context, plan Plan, logger Logger, shellRunner ShellRunner) int {
 	copyStatus := CopyFiles(plan, logger)
 	symlinkStatus := SymlinkFiles(plan, logger)
-	commandStatus := RunPostSetup(ctx, plan, logger, shellRunner)
-	if copyStatus == 0 && symlinkStatus == 0 && commandStatus == 0 {
+	randomizeStatus := RandomizeEnvPorts(plan, logger, AllocateLocalPort)
+	contextStatus := 0
+	if err := WriteContextEnv(plan); err != nil {
+		logger.Warn("failed to write workspace env: %s", err)
+		contextStatus = 1
+	}
+	commandStatus := RunPostCreate(ctx, plan, logger, shellRunner)
+	if copyStatus == 0 && symlinkStatus == 0 && randomizeStatus == 0 && contextStatus == 0 && commandStatus == 0 {
 		return 0
 	}
 	return 1
@@ -213,23 +192,294 @@ func SymlinkFiles(plan Plan, logger Logger) int {
 	return status
 }
 
-func RunPostSetup(ctx context.Context, plan Plan, logger Logger, shellRunner ShellRunner) int {
+type PortAllocator func() (int, error)
+
+func RandomizeEnvPorts(plan Plan, logger Logger, allocate PortAllocator) int {
+	if allocate == nil {
+		allocate = AllocateLocalPort
+	}
+	status := 0
+	used := map[int]bool{}
+	for _, item := range plan.RandomizePorts {
+		destinationPath := filepath.Join(plan.WorktreePath, item.File)
+		if !isWithin(plan.WorktreePath, destinationPath) {
+			logger.Warn("skipping unsafe randomize_ports path: %s", item.File)
+			status = 1
+			continue
+		}
+		source, err := os.ReadFile(destinationPath)
+		if os.IsNotExist(err) {
+			logger.Warn("randomize_ports file not found, skipping: %s", item.File)
+			continue
+		}
+		if err != nil {
+			logger.Warn("failed to read randomize_ports file %s: %s", item.File, err)
+			status = 1
+			continue
+		}
+		updated, changed, err := renderRandomizedEnv(string(source), item.Vars, used, allocate, plan.PreserveRandomPorts)
+		if err != nil {
+			logger.Warn("failed to randomize ports in %s: %s", item.File, err)
+			status = 1
+			continue
+		}
+		if !changed {
+			continue
+		}
+		stat, err := os.Stat(destinationPath)
+		if err != nil {
+			logger.Warn("failed to stat randomize_ports file %s: %s", item.File, err)
+			status = 1
+			continue
+		}
+		if err := os.WriteFile(destinationPath, []byte(updated), stat.Mode().Perm()); err != nil {
+			logger.Warn("failed to write randomized ports to %s: %s", item.File, err)
+			status = 1
+			continue
+		}
+		logger.Info("randomized ports in %s", item.File)
+	}
+	return status
+}
+
+func AllocateLocalPort() (int, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer listener.Close()
+	address, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0, fmt.Errorf("listener did not return a TCP address")
+	}
+	return address.Port, nil
+}
+
+func renderRandomizedEnv(source string, names []string, used map[int]bool, allocate PortAllocator, preserveExisting bool) (string, bool, error) {
+	wanted := map[string]bool{}
+	seen := map[string]bool{}
+	for _, name := range names {
+		wanted[name] = true
+	}
+	lines := strings.SplitAfter(source, "\n")
+	var output strings.Builder
+	changed := false
+	for _, line := range lines {
+		name, prefix, ok := envAssignment(line)
+		if !ok || !wanted[name] {
+			output.WriteString(line)
+			continue
+		}
+		seen[name] = true
+		if port, ok := existingEnvPort(line); ok && preserveExisting {
+			used[port] = true
+			output.WriteString(line)
+			continue
+		}
+		port, err := nextPort(used, allocate)
+		if err != nil {
+			return "", false, err
+		}
+		output.WriteString(prefix)
+		output.WriteString(strconv.Itoa(port))
+		if strings.HasSuffix(line, "\n") {
+			output.WriteByte('\n')
+		}
+		changed = true
+	}
+	for _, name := range names {
+		if seen[name] {
+			continue
+		}
+		port, err := nextPort(used, allocate)
+		if err != nil {
+			return "", false, err
+		}
+		if output.Len() > 0 && !strings.HasSuffix(output.String(), "\n") {
+			output.WriteByte('\n')
+		}
+		output.WriteString(name)
+		output.WriteByte('=')
+		output.WriteString(strconv.Itoa(port))
+		output.WriteByte('\n')
+		changed = true
+	}
+	return output.String(), changed, nil
+}
+
+func nextPort(used map[int]bool, allocate PortAllocator) (int, error) {
+	for attempts := 0; attempts < 100; attempts++ {
+		port, err := allocate()
+		if err != nil {
+			return 0, err
+		}
+		if port <= 0 || port > 65535 {
+			return 0, fmt.Errorf("allocated invalid port %d", port)
+		}
+		if used[port] {
+			continue
+		}
+		used[port] = true
+		return port, nil
+	}
+	return 0, fmt.Errorf("could not allocate a unique port")
+}
+
+func envAssignment(line string) (string, string, bool) {
+	trimmed := strings.TrimRight(line, "\r\n")
+	leadingLength := len(trimmed) - len(strings.TrimLeft(trimmed, " \t"))
+	leading := trimmed[:leadingLength]
+	rest := trimmed[leadingLength:]
+	export := ""
+	if strings.HasPrefix(rest, "export ") {
+		export = "export "
+		rest = strings.TrimLeft(strings.TrimPrefix(rest, "export "), " \t")
+	}
+	key, _, ok := strings.Cut(rest, "=")
+	if !ok {
+		return "", "", false
+	}
+	name := strings.TrimSpace(key)
+	if name == "" || strings.ContainsAny(name, " \t") {
+		return "", "", false
+	}
+	return name, leading + export + name + "=", true
+}
+
+func existingEnvPort(line string) (int, bool) {
+	trimmed := strings.TrimRight(line, "\r\n")
+	_, value, ok := strings.Cut(trimmed, "=")
+	if !ok {
+		return 0, false
+	}
+	value = strings.TrimSpace(value)
+	value = strings.Trim(value, `"'`)
+	port, err := strconv.Atoi(value)
+	return port, err == nil && port > 0 && port <= 65535
+}
+
+func WriteContextEnv(plan Plan) error {
+	envPath := ContextEnvPath(plan.WorktreePath)
+	if err := os.MkdirAll(filepath.Dir(envPath), 0o755); err != nil {
+		return err
+	}
+	content, err := RenderContextEnv(plan.Context)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(envPath, []byte(content), 0o600)
+}
+
+func RemoveContextEnv(worktreePath string) error {
+	envPath := ContextEnvPath(worktreePath)
+	if err := os.Remove(envPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func ContextEnvWorkspaceDirCount(worktreePath string) (int, error) {
+	source, err := os.ReadFile(ContextEnvPath(worktreePath))
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, line := range strings.Split(string(source), "\n") {
+		if isContextWorkspaceDirLine(strings.TrimSpace(line)) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func ContextEnvPath(worktreePath string) string {
+	return filepath.Join(worktreePath, ".wktree.env")
+}
+
+func RenderContextEnv(context Context) (string, error) {
+	values := map[string]string{}
+	namesByKey := map[string]string{}
+	for name, path := range context.WorkspacePaths {
+		key, err := config.WorkspaceDirEnvKey(name)
+		if err != nil {
+			return "", err
+		}
+		if previous, ok := namesByKey[key]; ok {
+			return "", fmt.Errorf("workspace env var %s conflicts between %q and %q", key, previous, name)
+		}
+		namesByKey[key] = name
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return "", err
+		}
+		values[key] = absolute
+	}
+
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var output strings.Builder
+	for _, key := range keys {
+		fmt.Fprintf(&output, "export %s=%s\n", key, shellQuote(values[key]))
+	}
+	return output.String(), nil
+}
+
+func RunPostCreate(ctx context.Context, plan Plan, logger Logger, shellRunner ShellRunner) int {
 	if shellRunner == nil {
 		shellRunner = DefaultShellRunner{}
 	}
-	for _, command := range plan.PostSetup {
+	for _, command := range plan.PostCreate {
 		logger.Info("$ %s", command)
-		result := shellRunner.RunShell(ctx, command, plan.WorktreePath, true)
+		result := shellRunner.RunShell(ctx, SourceEnvCommand(plan.WorktreePath, command), plan.WorktreePath, true)
 		if result.ExitCode != 0 {
 			detail := ""
 			if result.Err != nil {
 				detail = ": " + result.Err.Error()
 			}
-			logger.Warn("post setup command failed (%d)%s: %s", result.ExitCode, detail, command)
+			logger.Warn("post create command failed (%d)%s: %s", result.ExitCode, detail, command)
 			return 1
 		}
 	}
 	return 0
+}
+
+func SourceEnvCommand(worktreePath string, command string) string {
+	return ". " + shellQuote(ContextEnvPath(worktreePath)) + "; " + command
+}
+
+func JoinCommands(commands []string) string {
+	return strings.Join(commands, " && ")
+}
+
+func isContextWorkspaceDirLine(line string) bool {
+	const prefix = "export "
+	if !strings.HasPrefix(line, prefix) {
+		return false
+	}
+	key, value, ok := strings.Cut(strings.TrimPrefix(line, prefix), "=")
+	if !ok || key == "WKTREE_WORKSPACE_DIR" {
+		return false
+	}
+	if !strings.HasPrefix(key, "WKTREE_") || !strings.HasSuffix(key, "_DIR") {
+		return false
+	}
+	name := strings.TrimSuffix(strings.TrimPrefix(key, "WKTREE_"), "_DIR")
+	if name == "" {
+		return false
+	}
+	for _, char := range name {
+		if (char < 'A' || char > 'Z') && (char < '0' || char > '9') && char != '_' {
+			return false
+		}
+	}
+	return len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\''
 }
 
 func (logger Logger) Info(format string, args ...any) {
@@ -283,6 +533,10 @@ func isWithin(root string, candidate string) bool {
 func pathExists(candidate string) bool {
 	_, err := os.Lstat(candidate)
 	return err == nil || !os.IsNotExist(err)
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func shellResult(err error, stdout string, stderr string) run.Result {

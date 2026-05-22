@@ -50,6 +50,7 @@ type RemoveTarget struct {
 
 type CreateOptions struct {
 	Branch     string
+	From       string
 	HomeOption string
 	Cwd        string
 	Runner     run.Runner
@@ -59,6 +60,11 @@ type SwitchTarget struct {
 	Worktree   Worktree
 	StartPoint string
 	Track      bool
+}
+
+type CreateTarget struct {
+	Worktree   Worktree
+	StartPoint string
 }
 
 func RepoRoot(ctx context.Context, cwd string, runner run.Runner) (string, error) {
@@ -77,12 +83,24 @@ func OriginRemoteURL(ctx context.Context, repoRoot string, runner run.Runner) st
 	return strings.TrimSpace(result.Stdout)
 }
 
+func UserName(ctx context.Context, repoRoot string, runner run.Runner) string {
+	result := runGit(ctx, runner, repoRoot, []string{"config", "--get", "user.name"}, true)
+	if result.ExitCode != 0 {
+		return ""
+	}
+	return strings.TrimSpace(result.Stdout)
+}
+
 func RepoSlug(ctx context.Context, repoRoot string, runner run.Runner) (string, error) {
 	remote := OriginRemoteURL(ctx, repoRoot, runner)
 	if slug, ok, err := paths.ParseGitHubRemote(remote); ok || err != nil {
 		return slug, err
 	}
-	return paths.RepoDirectorySlug(repoRoot)
+	userName := UserName(ctx, repoRoot, runner)
+	if userName == "" {
+		return "", fmt.Errorf("repo has no supported GitHub remote and git config user.name is not set")
+	}
+	return paths.RepoDirectorySlug(repoRoot, userName)
 }
 
 func ListWorktrees(ctx context.Context, cwd string, runner run.Runner) (WorktreeList, error) {
@@ -138,54 +156,77 @@ func CompleteRemoveBranches(ctx context.Context, cwd string, prefix string, runn
 }
 
 func CreateWorktree(ctx context.Context, options CreateOptions) (Worktree, error) {
+	target, err := ResolveCreateWorktree(ctx, options)
+	if err != nil {
+		return Worktree{}, err
+	}
+	return CreateResolvedWorktree(ctx, target, options.Runner)
+}
+
+func ResolveCreateWorktree(ctx context.Context, options CreateOptions) (CreateTarget, error) {
 	runner := options.Runner
 	if runner == nil {
 		runner = run.DefaultRunner{}
 	}
 	if options.Branch == "" {
-		return Worktree{}, fmt.Errorf("branch name is required")
+		return CreateTarget{}, fmt.Errorf("branch name is required")
 	}
 
 	repoRoot, err := RepoRoot(ctx, options.Cwd, runner)
 	if err != nil {
-		return Worktree{}, err
+		return CreateTarget{}, err
 	}
 	if err := ensureBranchName(ctx, repoRoot, options.Branch, runner); err != nil {
-		return Worktree{}, err
+		return CreateTarget{}, err
 	}
-	if err := ensureHeadExists(ctx, repoRoot, runner); err != nil {
-		return Worktree{}, err
+	startPoint := options.From
+	if startPoint == "" {
+		startPoint = "HEAD"
+	}
+	if err := ensureStartPointExists(ctx, repoRoot, startPoint, runner); err != nil {
+		return CreateTarget{}, err
 	}
 	if exists, err := refExists(ctx, repoRoot, "refs/heads/"+options.Branch, runner); err != nil {
-		return Worktree{}, err
+		return CreateTarget{}, err
 	} else if exists {
-		return Worktree{}, fmt.Errorf("local branch already exists: %s", options.Branch)
+		return CreateTarget{}, fmt.Errorf("local branch already exists: %s", options.Branch)
 	}
 
 	remoteBranch := paths.StripOriginPrefix(options.Branch)
 	if exists, err := refExists(ctx, repoRoot, "refs/remotes/origin/"+remoteBranch, runner); err != nil {
-		return Worktree{}, err
+		return CreateTarget{}, err
 	} else if exists {
-		return Worktree{}, fmt.Errorf("origin branch already exists: origin/%s", remoteBranch)
+		return CreateTarget{}, fmt.Errorf("origin branch already exists: origin/%s", remoteBranch)
 	}
 
 	worktree, err := buildWorktree(ctx, repoRoot, options.Branch, options.HomeOption, runner)
 	if err != nil {
-		return Worktree{}, err
+		return CreateTarget{}, err
 	}
 	if err := ensureTargetPathAvailable(worktree.WorktreePath); err != nil {
-		return Worktree{}, err
+		return CreateTarget{}, err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(worktree.WorktreePath), 0o755); err != nil {
+	return CreateTarget{Worktree: worktree, StartPoint: startPoint}, nil
+}
+
+func CreateResolvedWorktree(ctx context.Context, target CreateTarget, runner run.Runner) (Worktree, error) {
+	if runner == nil {
+		runner = run.DefaultRunner{}
+	}
+	if err := ensureTargetPathAvailable(target.Worktree.WorktreePath); err != nil {
 		return Worktree{}, err
 	}
-	result := runGit(ctx, runner, repoRoot, []string{"worktree", "add", "-b", options.Branch, worktree.WorktreePath, "HEAD"}, false)
+	if err := os.MkdirAll(filepath.Dir(target.Worktree.WorktreePath), 0o755); err != nil {
+		return Worktree{}, err
+	}
+	addArgs := []string{"worktree", "add", "-b", target.Worktree.Branch, target.Worktree.WorktreePath, target.StartPoint}
+	result := runGit(ctx, runner, target.Worktree.RepoRoot, addArgs, false)
 	if result.Err != nil || result.ExitCode != 0 {
-		return Worktree{}, errors.New(run.FailureMessage("git", []string{"worktree", "add", "-b", options.Branch, worktree.WorktreePath, "HEAD"}, result))
+		return Worktree{}, errors.New(run.FailureMessage("git", addArgs, result))
 	}
 
-	return worktree, nil
+	return target.Worktree, nil
 }
 
 func ResolveSwitchWorktree(ctx context.Context, options CreateOptions) (SwitchTarget, error) {
@@ -336,6 +377,24 @@ func RemoveWorktree(ctx context.Context, target RemoveTarget, force bool, runner
 	return nil
 }
 
+func EnsureCleanWorktree(ctx context.Context, target RemoveTarget, runner run.Runner) error {
+	if runner == nil {
+		runner = run.DefaultRunner{}
+	}
+	args := []string{"status", "--porcelain"}
+	result := runGit(ctx, runner, target.WorktreePath, args, false)
+	if result.Err != nil || result.ExitCode != 0 {
+		return errors.New(run.FailureMessage("git", args, result))
+	}
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		if line == "" || isGeneratedStatusLine(line) {
+			continue
+		}
+		return fmt.Errorf("worktree contains modified or untracked files, use --force to delete it: %s", target.WorktreePath)
+	}
+	return nil
+}
+
 func buildWorktree(ctx context.Context, repoRoot string, branch string, homeOption string, runner run.Runner) (Worktree, error) {
 	repoSlug, err := RepoSlug(ctx, repoRoot, runner)
 	if err != nil {
@@ -479,6 +538,13 @@ func ensureBranchMerged(ctx context.Context, repoRoot string, branch string, run
 	}
 }
 
+func isGeneratedStatusLine(line string) bool {
+	if len(line) < 4 {
+		return false
+	}
+	return strings.TrimSpace(line[3:]) == ".wktree.env"
+}
+
 func samePath(left string, right string) bool {
 	leftAbs := cleanAbsPath(left)
 	rightAbs := cleanAbsPath(right)
@@ -515,9 +581,14 @@ func ensureBranchName(ctx context.Context, repoRoot string, branch string, runne
 }
 
 func ensureHeadExists(ctx context.Context, repoRoot string, runner run.Runner) error {
-	result := runGit(ctx, runner, repoRoot, []string{"rev-parse", "--verify", "HEAD"}, false)
+	return ensureStartPointExists(ctx, repoRoot, "HEAD", runner)
+}
+
+func ensureStartPointExists(ctx context.Context, repoRoot string, startPoint string, runner run.Runner) error {
+	args := []string{"rev-parse", "--verify", startPoint + "^{commit}"}
+	result := runGit(ctx, runner, repoRoot, args, false)
 	if result.Err != nil || result.ExitCode != 0 {
-		return errors.New(run.FailureMessage("git", []string{"rev-parse", "--verify", "HEAD"}, result))
+		return errors.New(run.FailureMessage("git", args, result))
 	}
 	return nil
 }

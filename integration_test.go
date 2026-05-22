@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -11,13 +12,13 @@ import (
 func TestWktreeNewCreatesStrictBranchAndWorktree(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)
-	env := testEnv(repo.root)
+	env := testEnv(t, repo.root)
 
-	result := runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "--no-setup", "--no-cd", "feature/example"}, repo.sourceRoot, env)
+	result := runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "feature/example"}, repo.sourceRoot, env)
 	if result.exitCode != 0 {
 		t.Fatalf("status=%d stderr=%s", result.exitCode, result.stderr)
 	}
-	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03_demo_feature-example")
+	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-example")
 	if _, err := os.Stat(worktreePath); err != nil {
 		t.Fatal(err)
 	}
@@ -28,29 +29,82 @@ func TestWktreeNewCreatesStrictBranchAndWorktree(t *testing.T) {
 		t.Fatalf("branch list = %q", got)
 	}
 
-	result = runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "--no-setup", "--no-cd", "feature/example"}, repo.sourceRoot, env)
+	result = runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "feature/example"}, repo.sourceRoot, env)
 	if result.exitCode == 0 || !strings.Contains(result.stderr, "local branch already exists: feature/example") {
 		t.Fatalf("expected local branch error, status=%d stderr=%s", result.exitCode, result.stderr)
 	}
 
 	git(t, []string{"update-ref", "refs/remotes/origin/feature/remote", "HEAD"}, repo.sourceRoot)
-	result = runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "--no-setup", "--no-cd", "feature/remote"}, repo.sourceRoot, env)
+	result = runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "feature/remote"}, repo.sourceRoot, env)
 	if result.exitCode == 0 || !strings.Contains(result.stderr, "origin branch already exists: origin/feature/remote") {
 		t.Fatalf("expected origin branch error, status=%d stderr=%s", result.exitCode, result.stderr)
 	}
 
-	existingPath := filepath.Join(repo.worktreeHome, "alienxp03_demo_feature-path-exists")
+	existingPath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-path-exists")
 	must(t, os.MkdirAll(existingPath, 0o755))
-	result = runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "--no-setup", "--no-cd", "feature/path-exists"}, repo.sourceRoot, env)
+	result = runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "feature/path-exists"}, repo.sourceRoot, env)
 	if result.exitCode == 0 || !strings.Contains(result.stderr, "target worktree path already exists") {
 		t.Fatalf("expected path exists error, status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+}
+
+func TestWktreeNewFromCreatesBranchFromStartPoint(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	env := testEnv(t, repo.root)
+	sourceBranch := git(t, []string{"branch", "--show-current"}, repo.sourceRoot)
+
+	git(t, []string{"checkout", "-b", "base/from"}, repo.sourceRoot)
+	write(t, filepath.Join(repo.sourceRoot, "from.txt"), "from branch\n")
+	git(t, []string{"add", "from.txt"}, repo.sourceRoot)
+	git(t, []string{"commit", "-m", "Base from commit"}, repo.sourceRoot)
+	baseCommit := git(t, []string{"rev-parse", "HEAD"}, repo.sourceRoot)
+	git(t, []string{"checkout", sourceBranch}, repo.sourceRoot)
+
+	result := runWktree(t, binary, []string{"new", "--from", "base/from", "--home", repo.worktreeHome, "feature/from"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-from")
+	if got := git(t, []string{"branch", "--show-current"}, worktreePath); got != "feature/from" {
+		t.Fatalf("branch = %q", got)
+	}
+	if got := git(t, []string{"rev-parse", "HEAD"}, worktreePath); got != baseCommit {
+		t.Fatalf("HEAD = %q, want %q", got, baseCommit)
+	}
+	if got := read(t, filepath.Join(worktreePath, "from.txt")); got != "from branch\n" {
+		t.Fatalf("from.txt = %q", got)
+	}
+}
+
+func TestWktreeNewUsesUserNameForRepoWithoutRemote(t *testing.T) {
+	binary := buildBinary(t)
+	root := t.TempDir()
+	sourceRoot := filepath.Join(root, "tree_1")
+	worktreeHome := filepath.Join(root, "worktrees")
+	must(t, os.MkdirAll(sourceRoot, 0o755))
+	git(t, []string{"init"}, sourceRoot)
+	git(t, []string{"config", "user.email", "test@example.com"}, sourceRoot)
+	git(t, []string{"config", "user.name", "alienxp03"}, sourceRoot)
+	write(t, filepath.Join(sourceRoot, "README.md"), "local\n")
+	git(t, []string{"add", "README.md"}, sourceRoot)
+	git(t, []string{"commit", "-m", "Initial commit"}, sourceRoot)
+	env := testEnv(t, root)
+
+	result := runWktree(t, binary, []string{"new", "--home", worktreeHome, "feature/testing_1"}, sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	worktreePath := filepath.Join(worktreeHome, "alienxp03", "tree_1", "feature-testing_1")
+	if got := git(t, []string{"branch", "--show-current"}, worktreePath); got != "feature/testing_1" {
+		t.Fatalf("branch = %q", got)
 	}
 }
 
 func TestWktreeSwitchCreatesAndReusesExistingBranchWorktree(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)
-	env := testEnv(repo.root)
+	env := testEnv(t, repo.root)
 	sourceBranch := git(t, []string{"branch", "--show-current"}, repo.sourceRoot)
 
 	git(t, []string{"checkout", "-b", "feature/existing"}, repo.sourceRoot)
@@ -60,12 +114,20 @@ func TestWktreeSwitchCreatesAndReusesExistingBranchWorktree(t *testing.T) {
 	existingCommit := git(t, []string{"rev-parse", "HEAD"}, repo.sourceRoot)
 	git(t, []string{"checkout", sourceBranch}, repo.sourceRoot)
 
-	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), "postSetup:\n  - printf switched > switched.txt\n")
-	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "--no-cd", "feature/existing"}, repo.sourceRoot, env)
+	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
+		"tmux_mode: window",
+		"workspaces:",
+		"  - name: app",
+		"    hooks:",
+		"      post_create:",
+		"        - printf switched > switched.txt",
+		"",
+	}, "\n"))
+	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "feature/existing"}, repo.sourceRoot, env)
 	if result.exitCode != 0 {
 		t.Fatalf("status=%d stderr=%s", result.exitCode, result.stderr)
 	}
-	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03_demo_feature-existing")
+	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-existing")
 	if got := git(t, []string{"branch", "--show-current"}, worktreePath); got != "feature/existing" {
 		t.Fatalf("branch = %q", got)
 	}
@@ -76,27 +138,35 @@ func TestWktreeSwitchCreatesAndReusesExistingBranchWorktree(t *testing.T) {
 		t.Fatalf("switched.txt = %q", got)
 	}
 
-	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), "postSetup:\n  - printf rerun > rerun.txt\n")
-	result = runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "--no-cd", "feature/existing"}, repo.sourceRoot, env)
+	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
+		"tmux_mode: window",
+		"workspaces:",
+		"  - name: app",
+		"    hooks:",
+		"      post_create:",
+		"        - printf rerun > rerun.txt",
+		"",
+	}, "\n"))
+	result = runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "feature/existing"}, repo.sourceRoot, env)
 	if result.exitCode != 0 {
 		t.Fatalf("reuse status=%d stderr=%s", result.exitCode, result.stderr)
 	}
-	if _, err := os.Stat(filepath.Join(worktreePath, "rerun.txt")); !os.IsNotExist(err) {
-		t.Fatalf("expected setup to be skipped on reused worktree, stat err=%v", err)
+	if got := read(t, filepath.Join(worktreePath, "rerun.txt")); got != "rerun" {
+		t.Fatalf("rerun.txt = %q", got)
 	}
 }
 
 func TestWktreeSwitchCreatesTrackingBranchFromOrigin(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)
-	env := testEnv(repo.root)
+	env := testEnv(t, repo.root)
 
 	git(t, []string{"update-ref", "refs/remotes/origin/feature/remote", "HEAD"}, repo.sourceRoot)
-	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "--no-setup", "--no-cd", "origin/feature/remote"}, repo.sourceRoot, env)
+	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "origin/feature/remote"}, repo.sourceRoot, env)
 	if result.exitCode != 0 {
 		t.Fatalf("status=%d stderr=%s", result.exitCode, result.stderr)
 	}
-	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03_demo_feature-remote")
+	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-remote")
 	if got := git(t, []string{"branch", "--show-current"}, worktreePath); got != "feature/remote" {
 		t.Fatalf("branch = %q", got)
 	}
@@ -108,9 +178,9 @@ func TestWktreeSwitchCreatesTrackingBranchFromOrigin(t *testing.T) {
 func TestWktreeSwitchRequiresExistingBranch(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)
-	env := testEnv(repo.root)
+	env := testEnv(t, repo.root)
 
-	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "--no-setup", "--no-cd", "feature/missing"}, repo.sourceRoot, env)
+	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "feature/missing"}, repo.sourceRoot, env)
 	if result.exitCode == 0 || !strings.Contains(result.stderr, "branch does not exist locally or on origin: feature/missing") {
 		t.Fatalf("expected missing branch error, status=%d stderr=%s", result.exitCode, result.stderr)
 	}
@@ -119,10 +189,10 @@ func TestWktreeSwitchRequiresExistingBranch(t *testing.T) {
 func TestWktreeListShowsAllWorktrees(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)
-	env := testEnv(repo.root)
+	env := testEnv(t, repo.root)
 	sourceBranch := git(t, []string{"branch", "--show-current"}, repo.sourceRoot)
 
-	result := runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "--no-setup", "--no-cd", "feature/listed"}, repo.sourceRoot, env)
+	result := runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "feature/listed"}, repo.sourceRoot, env)
 	if result.exitCode != 0 {
 		t.Fatalf("new status=%d stderr=%s", result.exitCode, result.stderr)
 	}
@@ -133,7 +203,7 @@ func TestWktreeListShowsAllWorktrees(t *testing.T) {
 	if result.exitCode != 0 {
 		t.Fatalf("list status=%d stderr=%s", result.exitCode, result.stderr)
 	}
-	for _, want := range []string{"CURRENT", "BRANCH", "HEAD", "PATH", sourceBranch, "feature/listed", "(detached)", "alienxp03_demo_feature-listed", "detached"} {
+	for _, want := range []string{"CURRENT", "BRANCH", "HEAD", "PATH", sourceBranch, "feature/listed", "(detached)", filepath.Join("alienxp03", "demo", "feature-listed"), "detached"} {
 		if !strings.Contains(result.stdout, want) {
 			t.Fatalf("list output missing %q:\n%s", want, result.stdout)
 		}
@@ -143,20 +213,78 @@ func TestWktreeListShowsAllWorktrees(t *testing.T) {
 	}
 }
 
+func TestWktreeDoctorReportsRepository(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	env := testEnv(t, repo.root)
+
+	result := runWktree(t, binary, []string{"doctor"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("doctor status=%d stdout=%s stderr=%s", result.exitCode, result.stdout, result.stderr)
+	}
+	for _, want := range []string{"[ok] repo root:", "[ok] repo slug:", "[ok] worktrees:", "[ok] config:"} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, result.stdout)
+		}
+	}
+}
+
+func TestWktreeInitCreatesProjectConfig(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	env := testEnv(t, repo.root)
+
+	result := runWktree(t, binary, []string{"init"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("init status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	configPath := filepath.Join(repo.sourceRoot, ".wktree.yaml")
+	if !strings.HasPrefix(result.stdout, "created ") || !strings.HasSuffix(strings.TrimSpace(result.stdout), string(filepath.Separator)+".wktree.yaml") {
+		t.Fatalf("stdout = %q", result.stdout)
+	}
+	config := read(t, configPath)
+	for _, want := range []string{"# worktree_dir: ~/workspace/worktrees", "# tmux_mode: window", "# workspace_mode: single", "# randomize_ports:", "#       - PORT", "name: window_name", "repo: ."} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("config missing %q:\n%s", want, config)
+		}
+	}
+
+	result = runWktree(t, binary, []string{"init"}, repo.sourceRoot, env)
+	if result.exitCode == 0 || !strings.Contains(result.stderr, "config already exists") {
+		t.Fatalf("expected existing config error, status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+}
+
 func TestWktreeRemoveDeletesWorktreeAndBranch(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)
-	env := testEnv(repo.root)
+	env := testEnv(t, repo.root)
 
-	result := runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "--no-setup", "--no-cd", "feature/remove"}, repo.sourceRoot, env)
+	result := runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "feature/remove"}, repo.sourceRoot, env)
 	if result.exitCode != 0 {
 		t.Fatalf("new status=%d stderr=%s", result.exitCode, result.stderr)
 	}
-	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03_demo_feature-remove")
+	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-remove")
 
 	result = runWktree(t, binary, []string{"__complete", "remove", "feature/r"}, repo.sourceRoot, env)
 	if result.exitCode != 0 || !strings.Contains(result.stdout, "feature/remove") {
 		t.Fatalf("remove completion status=%d stdout=%q stderr=%s", result.exitCode, result.stdout, result.stderr)
+	}
+
+	result = runWktree(t, binary, []string{"remove", "--dry-run", "feature/remove"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("dry-run remove status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	for _, want := range []string{"dry run: remove", "tmux mode:", "tmux kill-window", "git worktree remove", "git branch -d feature/remove"} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("dry-run output missing %q:\n%s", want, result.stdout)
+		}
+	}
+	if _, err := os.Stat(worktreePath); err != nil {
+		t.Fatalf("expected dry-run to keep worktree, stat err=%v", err)
+	}
+	if got := git(t, []string{"branch", "--list", "feature/remove"}, repo.sourceRoot); !strings.Contains(got, "feature/remove") {
+		t.Fatalf("expected dry-run to keep branch, branch list=%q", got)
 	}
 
 	result = runWktree(t, binary, []string{"remove", "feature/remove"}, repo.sourceRoot, env)
@@ -174,7 +302,7 @@ func TestWktreeRemoveDeletesWorktreeAndBranch(t *testing.T) {
 func TestWktreeRemoveRejectsCurrentWorktree(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)
-	env := testEnv(repo.root)
+	env := testEnv(t, repo.root)
 	sourceBranch := git(t, []string{"branch", "--show-current"}, repo.sourceRoot)
 
 	result := runWktree(t, binary, []string{"remove", sourceBranch}, repo.sourceRoot, env)
@@ -186,7 +314,7 @@ func TestWktreeRemoveRejectsCurrentWorktree(t *testing.T) {
 func TestWktreeRemoveForceDeletesUnmergedBranch(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)
-	env := testEnv(repo.root)
+	env := testEnv(t, repo.root)
 	sourceBranch := git(t, []string{"branch", "--show-current"}, repo.sourceRoot)
 
 	git(t, []string{"checkout", "-b", "feature/unmerged"}, repo.sourceRoot)
@@ -195,11 +323,11 @@ func TestWktreeRemoveForceDeletesUnmergedBranch(t *testing.T) {
 	git(t, []string{"commit", "-m", "Unmerged commit"}, repo.sourceRoot)
 	git(t, []string{"checkout", sourceBranch}, repo.sourceRoot)
 
-	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "--no-setup", "--no-cd", "feature/unmerged"}, repo.sourceRoot, env)
+	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "feature/unmerged"}, repo.sourceRoot, env)
 	if result.exitCode != 0 {
 		t.Fatalf("switch status=%d stderr=%s", result.exitCode, result.stderr)
 	}
-	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03_demo_feature-unmerged")
+	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-unmerged")
 
 	result = runWktree(t, binary, []string{"remove", "feature/unmerged"}, repo.sourceRoot, env)
 	if result.exitCode == 0 || !strings.Contains(result.stderr, "branch is not merged into current HEAD") {
@@ -221,7 +349,7 @@ func TestWktreeRemoveForceDeletesUnmergedBranch(t *testing.T) {
 func TestWktreeCompletesSwitchBranches(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)
-	env := testEnv(repo.root)
+	env := testEnv(t, repo.root)
 
 	git(t, []string{"branch", "feature/local"}, repo.sourceRoot)
 	git(t, []string{"update-ref", "refs/remotes/origin/feature/remote", "HEAD"}, repo.sourceRoot)
@@ -237,57 +365,235 @@ func TestWktreeCompletesSwitchBranches(t *testing.T) {
 	}
 }
 
-func TestWktreeNewAppliesSetupConfig(t *testing.T) {
+func TestWktreeNewAndRemoveWorkspaces(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)
-	env := testEnv(repo.root)
-	globalConfigDir := filepath.Join(envValue(env, "XDG_CONFIG_HOME"), "wktree")
-	must(t, os.MkdirAll(globalConfigDir, 0o755))
-	write(t, filepath.Join(repo.sourceRoot, ".env"), "GLOBAL_ENV=1\n")
-	write(t, filepath.Join(repo.sourceRoot, ".env.local"), "PROJECT_ENV=1\n")
-	write(t, filepath.Join(repo.sourceRoot, ".mcp.json"), "{\"global\":true}\n")
-	write(t, filepath.Join(repo.sourceRoot, ".tool-versions"), "go 1.26.1\n")
-	write(t, filepath.Join(globalConfigDir, "config.yaml"), strings.Join([]string{
-		"copy:",
-		"  - .env",
-		"  - .missing",
-		"symlink:",
-		"  - .mcp.json",
-		"  - .missing-link",
-		"postSetup:",
-		"  - printf global > global.txt",
-		"",
-	}, "\n"))
+	frontendRoot := createSiblingRepo(t, repo.root, "frontend", "frontend")
+	env := testEnv(t, repo.root)
 	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
-		"copy:",
-		"  - .env.local",
-		"symlink:",
-		"  - .tool-versions",
-		"postSetup:",
-		"  - printf project > project.txt",
+		"worktree_dir: " + repo.worktreeHome,
+		"tmux_mode: window",
+		"workspace_mode: all",
+		"workspaces:",
+		"  - name: backend",
+		"    panes:",
+		"      - command: nvim",
+		"  - name: frontend",
+		"    repo: ../frontend",
+		"    panes:",
+		"      - commands:",
+		"          - pnpm install",
+		"          - pnpm run dev",
 		"",
 	}, "\n"))
 
-	result := runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "--no-cd", "feature/setup"}, repo.sourceRoot, env)
+	result := runWktree(t, binary, []string{"new", "feature/full"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("new workspaces status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	backendPath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-full")
+	frontendPath := filepath.Join(repo.worktreeHome, "alienxp03", "frontend", "feature-full")
+	for _, item := range []struct {
+		path   string
+		branch string
+	}{
+		{backendPath, "feature/full"},
+		{frontendPath, "feature/full"},
+	} {
+		if got := git(t, []string{"branch", "--show-current"}, item.path); got != item.branch {
+			t.Fatalf("%s branch = %q", item.path, got)
+		}
+	}
+	backendEnv := read(t, filepath.Join(backendPath, ".wktree.env"))
+	for _, want := range []string{"WKTREE_BACKEND_DIR=", "WKTREE_FRONTEND_DIR="} {
+		if !strings.Contains(backendEnv, want) {
+			t.Fatalf("backend env missing %q:\n%s", want, backendEnv)
+		}
+	}
+	for _, notWant := range []string{"WKTREE_BRANCH=", "WKTREE_WORKSPACE=", "WKTREE_WORKSPACE_DIR="} {
+		if strings.Contains(backendEnv, notWant) {
+			t.Fatalf("backend env contains noisy var %q:\n%s", notWant, backendEnv)
+		}
+	}
+	if !strings.Contains(backendEnv, frontendPath) {
+		t.Fatalf("backend env missing frontend path:\n%s", backendEnv)
+	}
+
+	result = runWktree(t, binary, []string{"remove", "--dry-run", "feature/full"}, repo.sourceRoot, env)
+	if result.exitCode != 0 || !strings.Contains(result.stdout, "workspace: frontend") || !strings.Contains(result.stdout, "tmux mode: session") || !strings.Contains(result.stdout, "tmux kill-session") {
+		t.Fatalf("dry-run status=%d stdout=%s stderr=%s", result.exitCode, result.stdout, result.stderr)
+	}
+
+	result = runWktree(t, binary, []string{"remove", "--force", "feature/full"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("remove workspaces status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	if _, err := os.Stat(backendPath); !os.IsNotExist(err) {
+		t.Fatalf("expected backend removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(frontendPath); !os.IsNotExist(err) {
+		t.Fatalf("expected frontend removed, stat err=%v", err)
+	}
+	if got := git(t, []string{"branch", "--list", "feature/full"}, repo.sourceRoot); got != "" {
+		t.Fatalf("backend branch still exists: %q", got)
+	}
+	if got := git(t, []string{"branch", "--list", "feature/full"}, frontendRoot); got != "" {
+		t.Fatalf("frontend branch still exists: %q", got)
+	}
+}
+
+func TestWktreeRemoveRequiresWorkspacesForMultiWorkspaceEnv(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	frontendRoot := createSiblingRepo(t, repo.root, "frontend", "frontend")
+	env := testEnv(t, repo.root)
+	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
+		"worktree_dir: " + repo.worktreeHome,
+		"tmux_mode: window",
+		"workspaces:",
+		"  - name: backend",
+		"  - name: frontend",
+		"    repo: ../frontend",
+		"",
+	}, "\n"))
+
+	result := runWktree(t, binary, []string{"new", "--workspaces", "feature/guard"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("new workspaces status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	backendPath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-guard")
+	frontendPath := filepath.Join(repo.worktreeHome, "alienxp03", "frontend", "feature-guard")
+
+	result = runWktree(t, binary, []string{"remove", "--force", "feature/guard"}, repo.sourceRoot, env)
+	if result.exitCode == 0 || !strings.Contains(result.stderr, "multiple workspaces") || !strings.Contains(result.stderr, "--workspaces") {
+		t.Fatalf("remove status=%d stdout=%s stderr=%s", result.exitCode, result.stdout, result.stderr)
+	}
+	if _, err := os.Stat(backendPath); err != nil {
+		t.Fatalf("expected backend to remain, stat err=%v", err)
+	}
+	if _, err := os.Stat(frontendPath); err != nil {
+		t.Fatalf("expected frontend to remain, stat err=%v", err)
+	}
+
+	result = runWktree(t, binary, []string{"remove", "--force", "--workspaces", "feature/guard"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("remove workspaces status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	if _, err := os.Stat(backendPath); !os.IsNotExist(err) {
+		t.Fatalf("expected backend removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(frontendPath); !os.IsNotExist(err) {
+		t.Fatalf("expected frontend removed, stat err=%v", err)
+	}
+	if got := git(t, []string{"branch", "--list", "feature/guard"}, frontendRoot); got != "" {
+		t.Fatalf("frontend branch still exists: %q", got)
+	}
+}
+
+func TestWktreeRemoveWorkspacesPreflightsDirtyTargets(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	frontendRoot := createSiblingRepo(t, repo.root, "frontend", "frontend")
+	env := testEnv(t, repo.root)
+	write(t, filepath.Join(frontendRoot, ".env.local"), "FRONTEND_ENV=1\n")
+	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
+		"worktree_dir: " + repo.worktreeHome,
+		"workspace_mode: all",
+		"workspaces:",
+		"  - name: backend",
+		"  - name: frontend",
+		"    repo: ../frontend",
+		"    files:",
+		"      copy:",
+		"        - .env.local",
+		"",
+	}, "\n"))
+
+	result := runWktree(t, binary, []string{"new", "feature/dirty"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("new workspaces status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	backendPath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-dirty")
+	frontendPath := filepath.Join(repo.worktreeHome, "alienxp03", "frontend", "feature-dirty")
+
+	result = runWktree(t, binary, []string{"remove", "--workspaces", "feature/dirty"}, repo.sourceRoot, env)
+	if result.exitCode == 0 || !strings.Contains(result.stderr, "frontend: worktree contains modified or untracked files") || !strings.Contains(result.stderr, "--force") {
+		t.Fatalf("remove status=%d stdout=%s stderr=%s", result.exitCode, result.stdout, result.stderr)
+	}
+	if _, err := os.Stat(backendPath); err != nil {
+		t.Fatalf("expected backend to remain, stat err=%v", err)
+	}
+	if got := git(t, []string{"branch", "--list", "feature/dirty"}, repo.sourceRoot); !strings.Contains(got, "feature/dirty") {
+		t.Fatalf("expected backend branch to remain: %q", got)
+	}
+	if _, err := os.Stat(frontendPath); err != nil {
+		t.Fatalf("expected frontend to remain, stat err=%v", err)
+	}
+
+	result = runWktree(t, binary, []string{"remove", "--force", "--workspaces", "feature/dirty"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("force remove workspaces status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+}
+
+func TestWktreeNewAppliesSetupConfig(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	env := testEnv(t, repo.root)
+	write(t, filepath.Join(repo.sourceRoot, ".env.local"), "PROJECT_ENV=1\nPORT=3000\nAPP_PORT=3001\n")
+	write(t, filepath.Join(repo.sourceRoot, ".tool-versions"), "go 1.26.1\n")
+	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
+		"tmux_mode: window",
+		"defaults:",
+		"  files:",
+		"    copy:",
+		"      - .env.local",
+		"      - .missing",
+		"    symlink:",
+		"      - .tool-versions",
+		"      - .missing-link",
+		"workspaces:",
+		"  - name: app",
+		"    randomize_ports:",
+		"      - file: .env.local",
+		"        vars:",
+		"          - PORT",
+		"          - APP_PORT",
+		"    hooks:",
+		"      post_create:",
+		"        - printf project > project.txt",
+		"",
+	}, "\n"))
+
+	result := runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "feature/setup"}, repo.sourceRoot, env)
 	if result.exitCode != 0 {
 		t.Fatalf("status=%d stderr=%s", result.exitCode, result.stderr)
 	}
-	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03_demo_feature-setup")
-	globalLink := filepath.Join(worktreePath, ".mcp.json")
+	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-setup")
 	projectLink := filepath.Join(worktreePath, ".tool-versions")
-	if got := read(t, filepath.Join(worktreePath, ".env")); got != "GLOBAL_ENV=1\n" {
-		t.Fatalf(".env = %q", got)
+	envLocal := read(t, filepath.Join(worktreePath, ".env.local"))
+	if !strings.Contains(envLocal, "PROJECT_ENV=1\n") {
+		t.Fatalf(".env.local = %q", envLocal)
 	}
-	if got := read(t, filepath.Join(worktreePath, ".env.local")); got != "PROJECT_ENV=1\n" {
-		t.Fatalf(".env.local = %q", got)
+	port := envFileValue(t, envLocal, "PORT")
+	appPort := envFileValue(t, envLocal, "APP_PORT")
+	if port == "3000" || appPort == "3001" || port == appPort || !isPort(port) || !isPort(appPort) {
+		t.Fatalf("ports not randomized as expected: PORT=%q APP_PORT=%q\n%s", port, appPort, envLocal)
 	}
-	assertSymlinkTarget(t, globalLink, filepath.Join(repo.sourceRoot, ".mcp.json"))
+	result = runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "feature/setup"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("switch status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	switchedEnvLocal := read(t, filepath.Join(worktreePath, ".env.local"))
+	if switchedEnvLocal != envLocal {
+		t.Fatalf("switch should preserve randomized ports:\nbefore:\n%s\nafter:\n%s", envLocal, switchedEnvLocal)
+	}
 	assertSymlinkTarget(t, projectLink, filepath.Join(repo.sourceRoot, ".tool-versions"))
-	if got := read(t, filepath.Join(worktreePath, "global.txt")); got != "global" {
-		t.Fatalf("global.txt = %q", got)
-	}
 	if got := read(t, filepath.Join(worktreePath, "project.txt")); got != "project" {
 		t.Fatalf("project.txt = %q", got)
+	}
+	if got := read(t, filepath.Join(worktreePath, ".wktree.env")); !strings.Contains(got, "WKTREE_APP_DIR") {
+		t.Fatalf("workspace env = %q", got)
 	}
 	if !strings.Contains(result.stderr, "copy source not found, skipping: .missing") {
 		t.Fatalf("stderr missing copy warning: %s", result.stderr)
@@ -297,17 +603,25 @@ func TestWktreeNewAppliesSetupConfig(t *testing.T) {
 	}
 }
 
-func TestFailingPostSetupLeavesWorktreeIntact(t *testing.T) {
+func TestFailingPostCreateLeavesWorktreeIntact(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)
-	env := testEnv(repo.root)
-	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), "postSetup:\n  - exit 1\n")
+	env := testEnv(t, repo.root)
+	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
+		"tmux_mode: window",
+		"workspaces:",
+		"  - name: app",
+		"    hooks:",
+		"      post_create:",
+		"        - exit 1",
+		"",
+	}, "\n"))
 
-	result := runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "--no-cd", "feature/failsetup"}, repo.sourceRoot, env)
-	if result.exitCode != 1 || !strings.Contains(result.stderr, "post setup command failed") {
+	result := runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "feature/failsetup"}, repo.sourceRoot, env)
+	if result.exitCode != 1 || !strings.Contains(result.stderr, "post create command failed") {
 		t.Fatalf("expected setup failure, status=%d stderr=%s", result.exitCode, result.stderr)
 	}
-	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03_demo_feature-failsetup")
+	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-failsetup")
 	if _, err := os.Stat(worktreePath); err != nil {
 		t.Fatal(err)
 	}
@@ -348,6 +662,20 @@ func createTempRepo(t *testing.T) tempRepo {
 	return tempRepo{root: root, sourceRoot: sourceRoot, worktreeHome: filepath.Join(root, "worktrees")}
 }
 
+func createSiblingRepo(t *testing.T, root string, dirName string, remoteRepo string) string {
+	t.Helper()
+	sourceRoot := filepath.Join(root, dirName)
+	must(t, os.MkdirAll(sourceRoot, 0o755))
+	git(t, []string{"init"}, sourceRoot)
+	git(t, []string{"config", "user.email", "test@example.com"}, sourceRoot)
+	git(t, []string{"config", "user.name", "Test User"}, sourceRoot)
+	write(t, filepath.Join(sourceRoot, "README.md"), remoteRepo+"\n")
+	git(t, []string{"add", "README.md"}, sourceRoot)
+	git(t, []string{"commit", "-m", "Initial commit"}, sourceRoot)
+	git(t, []string{"remote", "add", "origin", "git@github.com:alienxp03/" + remoteRepo + ".git"}, sourceRoot)
+	return sourceRoot
+}
+
 type commandResult struct {
 	exitCode int
 	stdout   string
@@ -385,10 +713,26 @@ func git(t *testing.T, args []string, cwd string) string {
 	return strings.TrimSpace(string(output))
 }
 
-func testEnv(root string) []string {
+func testEnv(t *testing.T, root string) []string {
+	t.Helper()
+	binDir := filepath.Join(root, "bin")
+	must(t, os.MkdirAll(binDir, 0o755))
+	must(t, os.WriteFile(filepath.Join(binDir, "tmux"), []byte(strings.Join([]string{
+		"#!/bin/sh",
+		"case \"$1\" in",
+		"  -V) echo 'tmux 3.5'; exit 0 ;;",
+		"  has-session) exit 1 ;;",
+		"  list-windows) exit 0 ;;",
+		"  new-session|new-window|split-window) echo '%9'; exit 0 ;;",
+		"  *) exit 0 ;;",
+		"esac",
+		"",
+	}, "\n")), 0o755))
 	return append(os.Environ(),
 		"HOME="+filepath.Join(root, "home"),
 		"XDG_CONFIG_HOME="+filepath.Join(root, "xdg"),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"TMUX=/tmp/tmux",
 	)
 }
 
@@ -400,6 +744,23 @@ func envValue(env []string, key string) string {
 		}
 	}
 	return ""
+}
+
+func envFileValue(t *testing.T, content string, key string) string {
+	t.Helper()
+	for _, line := range strings.Split(content, "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if ok && strings.TrimSpace(k) == key {
+			return strings.Trim(strings.TrimSpace(v), `"'`)
+		}
+	}
+	t.Fatalf("env file missing %s:\n%s", key, content)
+	return ""
+}
+
+func isPort(value string) bool {
+	port, err := strconv.Atoi(value)
+	return err == nil && port > 0 && port <= 65535
 }
 
 func assertSymlinkTarget(t *testing.T, linkPath string, wantPath string) {

@@ -11,6 +11,7 @@ func TestBranchSlug(t *testing.T) {
 		"feature/example":               "feature-example",
 		"origin/feature/example branch": "feature-example-branch",
 		"feature/$bad:name":             "feature-bad-name",
+		"feature/testing_1":             "feature-testing_1",
 	}
 	for input, want := range tests {
 		got, err := BranchSlug(input)
@@ -37,8 +38,8 @@ func TestParseGitHubRemote(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ParseGitHubRemote(%q) returned error: %v", input, err)
 		}
-		if !ok || got != "alienxp03_dotfiles" {
-			t.Fatalf("ParseGitHubRemote(%q) = %q, %v; want alienxp03_dotfiles, true", input, got, ok)
+		if !ok || got != filepath.Join("alienxp03", "dotfiles") {
+			t.Fatalf("ParseGitHubRemote(%q) = %q, %v; want alienxp03/dotfiles, true", input, got, ok)
 		}
 	}
 	if _, ok, err := ParseGitHubRemote("https://example.com/alienxp03/dotfiles.git"); ok || err != nil {
@@ -47,11 +48,11 @@ func TestParseGitHubRemote(t *testing.T) {
 }
 
 func TestRepoDirectorySlug(t *testing.T) {
-	got, err := RepoDirectorySlug("/tmp/example repo")
+	got, err := RepoDirectorySlug("/tmp/example repo", "Test User")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "tmp_example-repo" {
+	if got != filepath.Join("Test-User", "example-repo") {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -80,8 +81,8 @@ func TestWorktreeHome(t *testing.T) {
 }
 
 func TestWorktreePath(t *testing.T) {
-	got := WorktreePath("/tmp/worktrees", "alienxp03_dotfiles", "feature-example")
-	want := filepath.Join("/tmp/worktrees", "alienxp03_dotfiles_feature-example")
+	got := WorktreePath("/tmp/worktrees", filepath.Join("alienxp03", "dotfiles"), "feature-example")
+	want := filepath.Join("/tmp/worktrees", "alienxp03", "dotfiles", "feature-example")
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}

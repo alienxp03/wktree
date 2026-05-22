@@ -12,30 +12,6 @@ import (
 	"github.com/alienxp03/wktree/internal/run"
 )
 
-func TestPlanRoundTrip(t *testing.T) {
-	root := t.TempDir()
-	planPath := filepath.Join(root, "plan.json")
-	plan := NewPlan(filepath.Join(root, "source"), filepath.Join(root, "worktree"), config.Config{
-		Copy:      []string{".env"},
-		Symlink:   []string{".mcp.json"},
-		PostSetup: []string{"pnpm install"},
-	})
-
-	if err := WritePlan(planPath, plan); err != nil {
-		t.Fatal(err)
-	}
-	got, err := ReadPlan(planPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.RepoRoot != plan.RepoRoot || got.WorktreePath != plan.WorktreePath {
-		t.Fatalf("plan mismatch: %#v", got)
-	}
-	assertSlice(t, got.Copy, plan.Copy)
-	assertSlice(t, got.Symlink, plan.Symlink)
-	assertSlice(t, got.PostSetup, plan.PostSetup)
-}
-
 func TestCopyFiles(t *testing.T) {
 	root := t.TempDir()
 	repoRoot := filepath.Join(root, "source")
@@ -148,20 +124,168 @@ func TestSymlinkFilesDoesNotOverwrite(t *testing.T) {
 	}
 }
 
-func TestRunPostSetupStopsOnFailure(t *testing.T) {
+func TestWriteContextEnv(t *testing.T) {
 	root := t.TempDir()
 	worktreePath := filepath.Join(root, "worktree")
 	must(t, os.MkdirAll(worktreePath, 0o755))
+	plan := Plan{
+		WorktreePath: worktreePath,
+		Context: Context{
+			WorkspacePaths: map[string]string{
+				"backend":       filepath.Join(root, "backend"),
+				"front-end app": filepath.Join(root, "frontend"),
+			},
+		},
+	}
+
+	if err := WriteContextEnv(plan); err != nil {
+		t.Fatal(err)
+	}
+	got := read(t, ContextEnvPath(worktreePath))
+	if ContextEnvPath(worktreePath) != filepath.Join(worktreePath, ".wktree.env") {
+		t.Fatalf("context env path = %q", ContextEnvPath(worktreePath))
+	}
+	for _, want := range []string{"WKTREE_BACKEND_DIR=", "WKTREE_FRONT_END_APP_DIR="} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("env missing %q:\n%s", want, got)
+		}
+	}
+	for _, notWant := range []string{"WKTREE_BRANCH=", "WKTREE_WORKSPACE=", "WKTREE_WORKSPACE_DIR="} {
+		if strings.Contains(got, notWant) {
+			t.Fatalf("env contains noisy var %q:\n%s", notWant, got)
+		}
+	}
+	if !strings.Contains(got, filepath.Join(root, "backend")) || !strings.Contains(got, filepath.Join(root, "frontend")) {
+		t.Fatalf("env should use absolute paths:\n%s", got)
+	}
+}
+
+func TestContextEnvWorkspaceDirCount(t *testing.T) {
+	root := t.TempDir()
+	worktreePath := filepath.Join(root, "worktree")
+	must(t, os.MkdirAll(worktreePath, 0o755))
+	write(t, ContextEnvPath(worktreePath), strings.Join([]string{
+		"export WKTREE_BACKEND_DIR='/tmp/backend'",
+		"export WKTREE_FRONTEND_DIR='/tmp/front'\\''end'",
+		"export WKTREE_WORKSPACE_DIR='/tmp/backend'",
+		"export WKTREE_BAD_DIR=/tmp/unquoted",
+		"export WKTREE_lower_DIR='/tmp/lower'",
+		"",
+	}, "\n"))
+
+	count, err := ContextEnvWorkspaceDirCount(worktreePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("count = %d", count)
+	}
+
+	count, err = ContextEnvWorkspaceDirCount(filepath.Join(root, "missing"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("missing count = %d", count)
+	}
+}
+
+func TestRandomizeEnvPortsRewritesConfiguredVariables(t *testing.T) {
+	root := t.TempDir()
+	worktreePath := filepath.Join(root, "worktree")
+	must(t, os.MkdirAll(worktreePath, 0o755))
+	write(t, filepath.Join(worktreePath, ".env.local"), strings.Join([]string{
+		"# app env",
+		"PORT=3000",
+		"export APP_PORT='3001'",
+		"OTHER_PORT=9999",
+		"",
+	}, "\n"))
+	logger, stdout, _ := captureLogger()
+	ports := portSequence(4100, 4101, 4102)
+
+	status := RandomizeEnvPorts(Plan{
+		WorktreePath: worktreePath,
+		RandomizePorts: []config.RandomizePort{
+			{File: ".env.local", Vars: []string{"PORT", "APP_PORT", "MISSING_PORT"}},
+		},
+	}, logger, ports)
+
+	if status != 0 {
+		t.Fatalf("status = %d", status)
+	}
+	got := read(t, filepath.Join(worktreePath, ".env.local"))
+	for _, want := range []string{"# app env", "PORT=4100", "export APP_PORT=4101", "OTHER_PORT=9999", "MISSING_PORT=4102"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("env missing %q:\n%s", want, got)
+		}
+	}
+	if !strings.Contains(stdout.String(), "randomized ports in .env.local") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestRandomizeEnvPortsPreservesExistingPortsWhenReused(t *testing.T) {
+	root := t.TempDir()
+	worktreePath := filepath.Join(root, "worktree")
+	must(t, os.MkdirAll(worktreePath, 0o755))
+	write(t, filepath.Join(worktreePath, ".env"), "PORT=4200\nAPP_PORT=not-a-port\n")
+
+	status := RandomizeEnvPorts(Plan{
+		WorktreePath:        worktreePath,
+		PreserveRandomPorts: true,
+		RandomizePorts: []config.RandomizePort{
+			{File: ".env", Vars: []string{"PORT", "APP_PORT"}},
+		},
+	}, Logger{}, portSequence(4300))
+
+	if status != 0 {
+		t.Fatalf("status = %d", status)
+	}
+	got := read(t, filepath.Join(worktreePath, ".env"))
+	for _, want := range []string{"PORT=4200", "APP_PORT=4300"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("env missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRandomizeEnvPortsMissingFileWarnsWithoutFailure(t *testing.T) {
+	root := t.TempDir()
+	worktreePath := filepath.Join(root, "worktree")
+	must(t, os.MkdirAll(worktreePath, 0o755))
+	logger, _, stderr := captureLogger()
+
+	status := RandomizeEnvPorts(Plan{
+		WorktreePath: worktreePath,
+		RandomizePorts: []config.RandomizePort{
+			{File: ".env.missing", Vars: []string{"PORT"}},
+		},
+	}, logger, portSequence(4100))
+
+	if status != 0 {
+		t.Fatalf("status = %d", status)
+	}
+	if !strings.Contains(stderr.String(), "randomize_ports file not found, skipping: .env.missing") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestRunPostCreateStopsOnFailure(t *testing.T) {
+	root := t.TempDir()
+	worktreePath := filepath.Join(root, "worktree")
+	must(t, os.MkdirAll(worktreePath, 0o755))
+	write(t, filepath.Join(worktreePath, ".wktree.env"), "export WKTREE_APP_DIR='/tmp/app'\n")
 	logger, _, stderr := captureLogger()
 	calls := []string{}
 
 	status := Run(context.Background(), Plan{
 		RepoRoot:     root,
 		WorktreePath: worktreePath,
-		PostSetup:    []string{"echo ok", "false", "echo later"},
+		PostCreate:   []string{"echo ok", "false", "echo later"},
 	}, logger, ShellRunnerFunc(func(_ context.Context, command string, cwd string, inherit bool) run.Result {
 		calls = append(calls, command+"@"+cwd)
-		if command == "false" {
+		if strings.Contains(command, "false") {
 			return run.Result{ExitCode: 1}
 		}
 		return run.Result{ExitCode: 0}
@@ -170,9 +294,23 @@ func TestRunPostSetupStopsOnFailure(t *testing.T) {
 	if status != 1 {
 		t.Fatalf("status = %d", status)
 	}
-	assertSlice(t, calls, []string{"echo ok@" + worktreePath, "false@" + worktreePath})
-	if !strings.Contains(stderr.String(), "post setup command failed") {
+	if len(calls) != 2 || !strings.Contains(calls[0], "echo ok@"+worktreePath) || !strings.Contains(calls[1], "false@"+worktreePath) {
+		t.Fatalf("calls = %#v", calls)
+	}
+	if !strings.Contains(stderr.String(), "post create command failed") {
 		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func portSequence(values ...int) PortAllocator {
+	index := 0
+	return func() (int, error) {
+		if index >= len(values) {
+			return 0, nil
+		}
+		value := values[index]
+		index++
+		return value, nil
 	}
 }
 
@@ -180,18 +318,6 @@ func captureLogger() (Logger, *bytes.Buffer, *bytes.Buffer) {
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	return Logger{Stdout: stdout, Stderr: stderr}, stdout, stderr
-}
-
-func assertSlice(t *testing.T, got []string, want []string) {
-	t.Helper()
-	if len(got) != len(want) {
-		t.Fatalf("got %#v, want %#v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("got %#v, want %#v", got, want)
-		}
-	}
 }
 
 func write(t *testing.T, filePath string, content string) {

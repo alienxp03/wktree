@@ -50,13 +50,13 @@ func ParseGitHubRemote(remoteURL string) (string, bool, error) {
 		if err != nil {
 			return "", false, err
 		}
-		return org + "_" + repo, true, nil
+		return filepath.Join(org, repo), true, nil
 	}
 	return "", false, nil
 }
 
-func RepoDirectorySlug(repoRoot string) (string, error) {
-	parent, err := PathSlugPart(filepath.Base(filepath.Dir(repoRoot)))
+func RepoDirectorySlug(repoRoot string, owner string) (string, error) {
+	ownerSlug, err := PathSlugPart(owner)
 	if err != nil {
 		return "", err
 	}
@@ -64,7 +64,7 @@ func RepoDirectorySlug(repoRoot string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return parent + "_" + repo, nil
+	return filepath.Join(ownerSlug, repo), nil
 }
 
 func PathSlugPart(value string) (string, error) {
@@ -102,5 +102,5 @@ func ExpandHome(input string, homeDir string) string {
 }
 
 func WorktreePath(worktreeHome string, repoSlug string, branchSlug string) string {
-	return filepath.Join(worktreeHome, repoSlug+"_"+branchSlug)
+	return filepath.Join(worktreeHome, repoSlug, branchSlug)
 }

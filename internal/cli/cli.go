@@ -10,6 +10,7 @@ import (
 
 	"github.com/alienxp03/wktree/internal/config"
 	"github.com/alienxp03/wktree/internal/git"
+	"github.com/alienxp03/wktree/internal/paths"
 	"github.com/alienxp03/wktree/internal/run"
 	"github.com/alienxp03/wktree/internal/setup"
 	"github.com/alienxp03/wktree/internal/shellinit"
@@ -25,6 +26,26 @@ type Options struct {
 	Stderr      io.Writer
 	Runner      run.Runner
 	ShellRunner setup.ShellRunner
+}
+
+type workspaceSpec struct {
+	Name     string
+	RepoRoot string
+	Config   config.Workspace
+}
+
+type workspaceSelection struct {
+	Config         config.Config
+	ConfigRepoRoot string
+	ConfigRepoSlug string
+	WorktreeHome   string
+	Workspaces     []workspaceSpec
+	AllWorkspaces  bool
+}
+
+type workspaceWorktree struct {
+	Spec     workspaceSpec
+	Worktree git.Worktree
 }
 
 func Run(args []string, options Options) int {
@@ -45,6 +66,8 @@ func Run(args []string, options Options) int {
 	switch args[0] {
 	case "__complete":
 		exitCode, err = runComplete(ctx, args[1:], app)
+	case "doctor":
+		exitCode, err = runDoctor(ctx, args[1:], app)
 	case "list":
 		exitCode, err = runList(ctx, args[1:], app)
 	case "new":
@@ -54,9 +77,9 @@ func Run(args []string, options Options) int {
 	case "switch":
 		exitCode, err = runSwitch(ctx, args[1:], app)
 	case "init":
-		exitCode, err = runInit(args[1:], app)
-	case "__setup":
-		exitCode, err = runDeferredSetup(ctx, args[1:], app)
+		exitCode, err = runInit(ctx, args[1:], app)
+	case "completion":
+		exitCode, err = runCompletion(args[1:], app)
 	default:
 		err = fmt.Errorf("unknown command: %s", args[0])
 		exitCode = 1
@@ -81,14 +104,24 @@ func runComplete(ctx context.Context, args []string, options Options) (int, erro
 	var values []string
 	var err error
 	switch command {
-	case "init":
+	case "completion":
 		values = filterPrefix([]string{"bash", "zsh"}, prefix)
+	case "init":
+		values = nil
+	case "doctor", "list":
+		values = nil
+	case "new":
+		values, err = completeWorktreeCommand(ctx, options, prefix, []string{"--home", "--from", "--workspaces"})
 	case "remove":
-		values, err = git.CompleteRemoveBranches(ctx, options.Cwd, prefix, options.Runner)
+		if strings.HasPrefix(prefix, "-") {
+			values = filterPrefix([]string{"--force", "--dry-run", "--workspaces"}, prefix)
+		} else {
+			values, err = git.CompleteRemoveBranches(ctx, options.Cwd, prefix, options.Runner)
+		}
 	case "switch":
-		values, err = git.CompleteSwitchBranches(ctx, options.Cwd, prefix, options.Runner)
+		values, err = completeWorktreeCommand(ctx, options, prefix, []string{"--home", "--workspaces"})
 	default:
-		values = filterPrefix([]string{"list", "new", "remove", "switch", "init"}, prefix)
+		values = filterPrefix([]string{"doctor", "list", "new", "remove", "switch", "init", "completion"}, prefix)
 	}
 	if err != nil {
 		return 1, err
@@ -97,6 +130,13 @@ func runComplete(ctx context.Context, args []string, options Options) (int, erro
 		fmt.Fprintln(options.Stdout, value)
 	}
 	return 0, nil
+}
+
+func completeWorktreeCommand(ctx context.Context, options Options, prefix string, flags []string) ([]string, error) {
+	if strings.HasPrefix(prefix, "-") {
+		return filterPrefix(flags, prefix), nil
+	}
+	return git.CompleteSwitchBranches(ctx, options.Cwd, prefix, options.Runner)
 }
 
 func runList(ctx context.Context, args []string, options Options) (int, error) {
@@ -111,28 +151,177 @@ func runList(ctx context.Context, args []string, options Options) (int, error) {
 	return 0, nil
 }
 
+func runDoctor(ctx context.Context, args []string, options Options) (int, error) {
+	if len(args) != 0 {
+		return 1, fmt.Errorf("usage: wktree doctor")
+	}
+
+	status := 0
+	repoRoot, err := git.RepoRoot(ctx, options.Cwd, options.Runner)
+	if err != nil {
+		fmt.Fprintf(options.Stdout, "[error] git repository: %s\n", err)
+		return 1, nil
+	}
+	fmt.Fprintf(options.Stdout, "[ok] repo root: %s\n", repoRoot)
+
+	if repoSlug, err := git.RepoSlug(ctx, repoRoot, options.Runner); err != nil {
+		fmt.Fprintf(options.Stdout, "[error] repo slug: %s\n", err)
+		status = 1
+	} else {
+		fmt.Fprintf(options.Stdout, "[ok] repo slug: %s\n", repoSlug)
+	}
+
+	if worktrees, err := git.ListWorktrees(ctx, repoRoot, options.Runner); err != nil {
+		fmt.Fprintf(options.Stdout, "[error] worktrees: %s\n", err)
+		status = 1
+	} else {
+		fmt.Fprintf(options.Stdout, "[ok] worktrees: %d\n", len(worktrees.Worktrees))
+	}
+
+	selection, err := resolveWorkspaceSelection(ctx, options, "", true)
+	if err != nil {
+		fmt.Fprintf(options.Stdout, "[error] config: %s\n", err)
+		status = 1
+	} else {
+		fmt.Fprintf(options.Stdout, "[ok] project config path: %s\n", config.ProjectPath(selection.ConfigRepoRoot))
+		fmt.Fprintf(options.Stdout, "[ok] config: tmux_mode=%s workspace_mode=%s workspaces=%d\n", selection.Config.TmuxMode, selection.Config.WorkspaceMode, len(selection.Workspaces))
+	}
+
+	if err := tmux.Available(ctx, options.Runner); err != nil {
+		fmt.Fprintf(options.Stdout, "[warn] tmux: not available (%s)\n", err)
+	} else {
+		fmt.Fprintln(options.Stdout, "[ok] tmux: available")
+	}
+	fmt.Fprintln(options.Stdout, "[info] shell integration: eval \"$(wktree completion zsh)\" or eval \"$(wktree completion bash)\"")
+
+	return status, nil
+}
+
+func runNew(ctx context.Context, args []string, options Options) (int, error) {
+	parsed, err := parseWorktreeArgs("new", args)
+	if err != nil {
+		return 1, err
+	}
+	selection, err := resolveWorkspaceSelection(ctx, options, parsed.Home, parsed.Workspaces)
+	if err != nil {
+		return 1, err
+	}
+
+	targets := make([]git.CreateTarget, 0, len(selection.Workspaces))
+	for _, workspace := range selection.Workspaces {
+		target, err := git.ResolveCreateWorktree(ctx, git.CreateOptions{
+			Branch:     parsed.Branch,
+			From:       parsed.From,
+			HomeOption: selection.WorktreeHome,
+			Cwd:        workspace.RepoRoot,
+			Runner:     options.Runner,
+		})
+		if err != nil {
+			return 1, fmt.Errorf("%s: %w", workspace.Name, err)
+		}
+		targets = append(targets, target)
+	}
+
+	worktrees := make([]workspaceWorktree, 0, len(targets))
+	for index, target := range targets {
+		worktree, err := git.CreateResolvedWorktree(ctx, target, options.Runner)
+		if err != nil {
+			return 1, fmt.Errorf("%s: %w", selection.Workspaces[index].Name, err)
+		}
+		worktrees = append(worktrees, workspaceWorktree{Spec: selection.Workspaces[index], Worktree: worktree})
+	}
+	return finishWorkspaceCommand(ctx, selection, parsed.Branch, worktrees, options)
+}
+
+func runSwitch(ctx context.Context, args []string, options Options) (int, error) {
+	parsed, err := parseWorktreeArgs("switch", args)
+	if err != nil {
+		return 1, err
+	}
+	selection, err := resolveWorkspaceSelection(ctx, options, parsed.Home, parsed.Workspaces)
+	if err != nil {
+		return 1, err
+	}
+
+	targets := make([]git.SwitchTarget, 0, len(selection.Workspaces))
+	for _, workspace := range selection.Workspaces {
+		target, err := git.ResolveSwitchWorktree(ctx, git.CreateOptions{
+			Branch:     parsed.Branch,
+			HomeOption: selection.WorktreeHome,
+			Cwd:        workspace.RepoRoot,
+			Runner:     options.Runner,
+		})
+		if err != nil {
+			return 1, fmt.Errorf("%s: %w", workspace.Name, err)
+		}
+		targets = append(targets, target)
+	}
+
+	worktrees := make([]workspaceWorktree, 0, len(targets))
+	for index, target := range targets {
+		worktree, err := git.SwitchWorktree(ctx, target, options.Runner)
+		if err != nil {
+			return 1, fmt.Errorf("%s: %w", selection.Workspaces[index].Name, err)
+		}
+		worktrees = append(worktrees, workspaceWorktree{Spec: selection.Workspaces[index], Worktree: worktree})
+	}
+	return finishWorkspaceCommand(ctx, selection, parsed.Branch, worktrees, options)
+}
+
 func runRemove(ctx context.Context, args []string, options Options) (int, error) {
 	parsed, err := parseRemoveArgs(args)
 	if err != nil {
 		return 1, err
 	}
-	target, err := git.ResolveRemoveTarget(ctx, git.RemoveOptions{Branch: parsed.Branch, Cwd: options.Cwd, Force: parsed.Force, Runner: options.Runner})
+	selection, err := resolveWorkspaceSelection(ctx, options, "", parsed.Workspaces)
 	if err != nil {
 		return 1, err
 	}
-	if err := tmux.KillSessionForWorktree(ctx, target.WorktreePath, options.Runner); err != nil {
+
+	targets := make([]git.RemoveTarget, 0, len(selection.Workspaces))
+	for _, workspace := range selection.Workspaces {
+		target, err := git.ResolveRemoveTarget(ctx, git.RemoveOptions{Branch: parsed.Branch, Cwd: workspace.RepoRoot, Force: parsed.Force, Runner: options.Runner})
+		if err != nil {
+			return 1, fmt.Errorf("%s: %w", workspace.Name, err)
+		}
+		targets = append(targets, target)
+	}
+	if !selection.AllWorkspaces {
+		if err := ensureSingleWorkspaceRemove(parsed.Branch, targets[0]); err != nil {
+			return 1, err
+		}
+	}
+	if parsed.DryRun {
+		fmt.Fprint(options.Stdout, renderRemoveDryRun(selection, parsed.Branch, targets, parsed.Force))
+		return 0, nil
+	}
+	if !parsed.Force {
+		for index, target := range targets {
+			if err := git.EnsureCleanWorktree(ctx, target, options.Runner); err != nil {
+				return 1, fmt.Errorf("%s: %w", selection.Workspaces[index].Name, err)
+			}
+		}
+	}
+	if err := killWorkspaceTmux(ctx, selection, parsed.Branch, options); err != nil {
 		return 1, err
 	}
-	if err := git.RemoveWorktree(ctx, target, parsed.Force, options.Runner); err != nil {
-		return 1, err
+	for index, target := range targets {
+		if err := setup.RemoveContextEnv(target.WorktreePath); err != nil {
+			return 1, fmt.Errorf("%s: %w", selection.Workspaces[index].Name, err)
+		}
+		if err := git.RemoveWorktree(ctx, target, parsed.Force, options.Runner); err != nil {
+			return 1, fmt.Errorf("%s: %w", selection.Workspaces[index].Name, err)
+		}
 	}
-	fmt.Fprintf(options.Stdout, "removed %s\n", target.Branch)
+	fmt.Fprintf(options.Stdout, "removed %s\n", parsed.Branch)
 	return 0, nil
 }
 
 type removeArgs struct {
-	Branch string
-	Force  bool
+	Branch     string
+	Force      bool
+	DryRun     bool
+	Workspaces bool
 }
 
 func parseRemoveArgs(args []string) (removeArgs, error) {
@@ -142,6 +331,10 @@ func parseRemoveArgs(args []string) (removeArgs, error) {
 		switch {
 		case arg == "--force" || arg == "-f":
 			parsed.Force = true
+		case arg == "--dry-run":
+			parsed.DryRun = true
+		case arg == "--workspaces":
+			parsed.Workspaces = true
 		case strings.HasPrefix(arg, "-"):
 			return removeArgs{}, fmt.Errorf("unknown option: %s", arg)
 		default:
@@ -149,141 +342,252 @@ func parseRemoveArgs(args []string) (removeArgs, error) {
 		}
 	}
 	if len(positionals) != 1 {
-		return removeArgs{}, fmt.Errorf("usage: wktree remove [--force] <branch>")
+		return removeArgs{}, fmt.Errorf("usage: wktree remove [--force] [--dry-run] [--workspaces] <branch>")
 	}
 	parsed.Branch = positionals[0]
 	return parsed, nil
 }
 
-func runNew(ctx context.Context, args []string, options Options) (int, error) {
-	parsed, err := parseWorktreeArgs("new", args)
-	if err != nil {
-		return 1, err
+func renderRemoveDryRun(selection workspaceSelection, branch string, targets []git.RemoveTarget, force bool) string {
+	worktreeRemove := "git worktree remove"
+	branchDelete := "git branch -d"
+	if force {
+		worktreeRemove = "git worktree remove --force"
+		branchDelete = "git branch -D"
 	}
 
-	setupConfig := config.Config{}
-	if !parsed.NoSetup {
-		repoRoot, err := git.RepoRoot(ctx, options.Cwd, options.Runner)
-		if err != nil {
-			return 1, err
-		}
-		setupConfig, err = loadSetupConfig(repoRoot, options)
-		if err != nil {
-			return 1, err
-		}
+	var output strings.Builder
+	fmt.Fprintln(&output, "dry run: remove")
+	fmt.Fprintf(&output, "branch: %s\n", branch)
+	fmt.Fprintf(&output, "tmux mode: %s\n", effectiveTmuxMode(selection))
+	for index, target := range targets {
+		workspace := selection.Workspaces[index]
+		fmt.Fprintf(&output, "workspace: %s\n", workspace.Name)
+		fmt.Fprintf(&output, "  worktree: %s\n", target.WorktreePath)
 	}
-
-	worktree, err := git.CreateWorktree(ctx, git.CreateOptions{
-		Branch:     parsed.Branch,
-		HomeOption: parsed.Home,
-		Cwd:        options.Cwd,
-		Runner:     options.Runner,
-	})
-	if err != nil {
-		return 1, err
+	fmt.Fprintln(&output, "actions:")
+	for _, action := range tmuxRemovalActions(selection, branch) {
+		fmt.Fprintf(&output, "  %s\n", action)
 	}
-	return finishWorktreeCommand(ctx, parsed, worktree, setupConfig, options)
+	for _, target := range targets {
+		fmt.Fprintf(&output, "  %s %s\n", worktreeRemove, target.WorktreePath)
+		fmt.Fprintf(&output, "  %s %s\n", branchDelete, target.Branch)
+	}
+	return output.String()
 }
 
-func runSwitch(ctx context.Context, args []string, options Options) (int, error) {
-	parsed, err := parseWorktreeArgs("switch", args)
-	if err != nil {
-		return 1, err
-	}
-
-	target, err := git.ResolveSwitchWorktree(ctx, git.CreateOptions{
-		Branch:     parsed.Branch,
-		HomeOption: parsed.Home,
-		Cwd:        options.Cwd,
-		Runner:     options.Runner,
-	})
-	if err != nil {
-		return 1, err
-	}
-
-	setupConfig := config.Config{}
-	if !parsed.NoSetup && !target.Worktree.Reused {
-		setupConfig, err = loadSetupConfig(target.Worktree.RepoRoot, options)
-		if err != nil {
-			return 1, err
-		}
-	}
-
-	worktree, err := git.SwitchWorktree(ctx, target, options.Runner)
-	if err != nil {
-		return 1, err
-	}
-	return finishWorktreeCommand(ctx, parsed, worktree, setupConfig, options)
-}
-
-func loadSetupConfig(repoRoot string, options Options) (config.Config, error) {
-	return config.LoadMerged(repoRoot, config.LoadOptions{Env: options.Env})
-}
-
-func finishWorktreeCommand(ctx context.Context, parsed worktreeArgs, worktree git.Worktree, setupConfig config.Config, options Options) (int, error) {
-	setupPlan := setup.NewPlan(worktree.RepoRoot, worktree.WorktreePath, setupConfig)
+func finishWorkspaceCommand(ctx context.Context, selection workspaceSelection, branch string, worktrees []workspaceWorktree, options Options) (int, error) {
+	contexts := workspaceContexts(branch, worktrees)
 	logger := setup.Logger{Stdout: options.Stdout, Stderr: options.Stderr}
+	status := 0
+	for _, worktree := range worktrees {
+		files := config.WorkspaceFiles(selection.Config, worktree.Spec.Config)
+		hooks := config.WorkspaceHooks(selection.Config, worktree.Spec.Config)
+		plan := setup.NewPlan(worktree.Worktree.RepoRoot, worktree.Worktree.WorktreePath, worktree.Spec.Name, branch, files, hooks, worktree.Spec.Config.RandomizePorts, worktree.Worktree.Reused, contexts[worktree.Spec.Name])
+		if setup.Run(ctx, plan, logger, options.ShellRunner) != 0 {
+			status = 1
+		}
+	}
+	windows := tmuxWindows(selection, branch, worktrees)
+	openStatus, err := tmux.OpenLayout(ctx, tmux.LayoutOptions{
+		Mode:        effectiveTmuxMode(selection),
+		SessionName: sessionName(selection, branch),
+		Windows:     windows,
+		Env:         options.Env,
+		Runner:      options.Runner,
+	})
+	if err != nil {
+		return 1, err
+	}
+	if status != 0 {
+		return status, nil
+	}
+	return openStatus, nil
+}
 
-	if parsed.Tmux {
-		return tmux.Open(ctx, tmux.Options{
-			WorktreePath: worktree.WorktreePath,
-			RepoSlug:     worktree.RepoSlug,
-			BranchSlug:   worktree.BranchSlug,
-			SetupPlan:    setupPlan,
-			Env:          options.Env,
-			Runner:       options.Runner,
-			Logger:       logger,
-		})
+func resolveWorkspaceSelection(ctx context.Context, options Options, homeOption string, allWorkspaces bool) (workspaceSelection, error) {
+	configRepoRoot, err := git.RepoRoot(ctx, options.Cwd, options.Runner)
+	if err != nil {
+		return workspaceSelection{}, err
+	}
+	configRepoSlug, err := git.RepoSlug(ctx, configRepoRoot, options.Runner)
+	if err != nil {
+		return workspaceSelection{}, err
+	}
+	homeDir, err := homeDir(options)
+	if err != nil {
+		return workspaceSelection{}, err
+	}
+	projectConfig, err := config.LoadProject(configRepoRoot, homeDir)
+	if err != nil {
+		return workspaceSelection{}, err
+	}
+	if len(projectConfig.Workspaces) == 0 {
+		projectConfig.Workspaces = []config.Workspace{{Name: configRepoSlug}}
 	}
 
-	if !parsed.NoCD {
-		if cdFile := options.Env["WKTREE_CD_FILE"]; cdFile != "" {
-			if err := os.WriteFile(cdFile, []byte(worktree.WorktreePath+"\n"), 0o600); err != nil {
-				return 1, err
+	configDir := filepath.Dir(config.ProjectPath(configRepoRoot))
+	workspaces := projectConfig.Workspaces
+	selectedAllWorkspaces := allWorkspaces || projectConfig.WorkspaceMode == config.WorkspaceModeAll
+	if !selectedAllWorkspaces {
+		workspaces = workspaces[:1]
+	}
+
+	selected := make([]workspaceSpec, 0, len(workspaces))
+	seenRepos := map[string]string{}
+	for _, workspace := range workspaces {
+		repoPath := configRepoRoot
+		if workspace.Repo != "" {
+			repoPath, err = config.ExpandConfiguredPath(workspace.Repo, homeDir, configDir)
+			if err != nil {
+				return workspaceSelection{}, fmt.Errorf("%s repo: %w", workspace.Name, err)
 			}
 		}
+		repoRoot, err := git.RepoRoot(ctx, repoPath, options.Runner)
+		if err != nil {
+			return workspaceSelection{}, fmt.Errorf("%s repo: %w", workspace.Name, err)
+		}
+		if previous, ok := seenRepos[cleanAbsPath(repoRoot)]; ok {
+			return workspaceSelection{}, fmt.Errorf("workspaces %q and %q resolve to the same repo: %s", previous, workspace.Name, repoRoot)
+		}
+		seenRepos[cleanAbsPath(repoRoot)] = workspace.Name
+		selected = append(selected, workspaceSpec{Name: workspace.Name, RepoRoot: repoRoot, Config: workspace})
 	}
 
-	if parsed.NoSetup || !config.HasSetup(setupConfig) {
-		return 0, nil
+	worktreeHome := homeOption
+	if worktreeHome == "" {
+		worktreeHome = projectConfig.WorktreeDir
 	}
-	if !parsed.NoCD {
-		if setupFile := options.Env["WKTREE_SETUP_FILE"]; setupFile != "" {
-			return 0, setup.WritePlan(setupFile, setupPlan)
+	if worktreeHome != "" {
+		worktreeHome, err = config.ExpandConfiguredPath(worktreeHome, homeDir, configDir)
+		if err != nil {
+			return workspaceSelection{}, fmt.Errorf("worktree_dir: %w", err)
 		}
 	}
-	return setup.Run(ctx, setupPlan, logger, options.ShellRunner), nil
+
+	return workspaceSelection{
+		Config:         projectConfig,
+		ConfigRepoRoot: configRepoRoot,
+		ConfigRepoSlug: configRepoSlug,
+		WorktreeHome:   worktreeHome,
+		Workspaces:     selected,
+		AllWorkspaces:  selectedAllWorkspaces,
+	}, nil
 }
 
-func runInit(args []string, options Options) (int, error) {
-	if len(args) != 1 {
-		return 1, fmt.Errorf("usage: wktree init <zsh|bash>")
+func workspaceContexts(branch string, worktrees []workspaceWorktree) map[string]setup.Context {
+	workspacePaths := map[string]string{}
+	for _, worktree := range worktrees {
+		workspacePaths[worktree.Spec.Name] = worktree.Worktree.WorktreePath
 	}
-	initScript, err := shellinit.Generate(args[0])
-	if err != nil {
-		return 1, err
+	contexts := map[string]setup.Context{}
+	for _, worktree := range worktrees {
+		contexts[worktree.Spec.Name] = setup.Context{
+			WorkspacePaths: workspacePaths,
+		}
 	}
-	fmt.Fprint(options.Stdout, initScript)
-	return 0, nil
+	return contexts
 }
 
-func runDeferredSetup(ctx context.Context, args []string, options Options) (int, error) {
-	if len(args) != 1 {
-		return 1, fmt.Errorf("usage: wktree __setup <plan-file>")
+func tmuxWindows(selection workspaceSelection, branch string, worktrees []workspaceWorktree) []tmux.Window {
+	windows := make([]tmux.Window, 0, len(worktrees))
+	for _, worktree := range worktrees {
+		windows = append(windows, tmux.Window{
+			Name:         workspaceWindowName(worktree.Spec.Name),
+			WorktreePath: worktree.Worktree.WorktreePath,
+			Commands:     paneCommands(config.WorkspacePanes(worktree.Spec.Config)),
+		})
 	}
-	setupPlan, err := setup.ReadPlan(args[0])
+	return windows
+}
+
+func paneCommands(commands []config.PaneCommand) []tmux.PaneCommand {
+	converted := make([]tmux.PaneCommand, 0, len(commands))
+	for _, command := range commands {
+		converted = append(converted, tmux.PaneCommand{
+			Command:    command.Command,
+			Commands:   append([]string(nil), command.Commands...),
+			Split:      command.Split,
+			Focus:      command.Focus,
+			Zoom:       command.Zoom,
+			Size:       command.Size,
+			Percentage: command.Percentage,
+		})
+	}
+	return converted
+}
+
+func killWorkspaceTmux(ctx context.Context, selection workspaceSelection, branch string, options Options) error {
+	mode := effectiveTmuxMode(selection)
+	return tmux.KillLayout(ctx, tmux.KillOptions{
+		Mode:        mode,
+		SessionName: sessionName(selection, branch),
+		WindowNames: workspaceWindowNames(selection),
+		KillSession: mode == tmux.ModeSession && selection.AllWorkspaces,
+		Env:         options.Env,
+		Runner:      options.Runner,
+	})
+}
+
+func ensureSingleWorkspaceRemove(branch string, target git.RemoveTarget) error {
+	count, err := setup.ContextEnvWorkspaceDirCount(target.WorktreePath)
 	if err != nil {
-		return 1, err
+		return err
 	}
-	return setup.Run(ctx, setupPlan, setup.Logger{Stdout: options.Stdout, Stderr: options.Stderr}, options.ShellRunner), nil
+	if count > 1 {
+		return fmt.Errorf("branch appears to use multiple workspaces from .wktree.env; rerun with --workspaces to remove all: %s", branch)
+	}
+	return nil
+}
+
+func tmuxRemovalActions(selection workspaceSelection, branch string) []string {
+	mode := effectiveTmuxMode(selection)
+	if mode == tmux.ModeSession && selection.AllWorkspaces {
+		return []string{"tmux kill-session -t " + sessionName(selection, branch) + " if it exists"}
+	}
+	actions := []string{}
+	for _, windowName := range workspaceWindowNames(selection) {
+		target := windowName
+		if mode == tmux.ModeSession {
+			target = sessionName(selection, branch) + ":" + windowName
+		}
+		actions = append(actions, "tmux kill-window -t "+target+" if it exists")
+	}
+	return actions
+}
+
+func effectiveTmuxMode(selection workspaceSelection) string {
+	if selection.AllWorkspaces {
+		return tmux.ModeSession
+	}
+	return selection.Config.TmuxMode
+}
+
+func workspaceWindowNames(selection workspaceSelection) []string {
+	names := make([]string, 0, len(selection.Workspaces))
+	for _, workspace := range selection.Workspaces {
+		names = append(names, workspaceWindowName(workspace.Name))
+	}
+	return names
+}
+
+func workspaceWindowName(workspaceName string) string {
+	return tmux.TargetName(workspaceName)
+}
+
+func sessionName(selection workspaceSelection, branch string) string {
+	branchSlug, err := paths.BranchSlug(branch)
+	if err != nil {
+		branchSlug = "branch"
+	}
+	return tmux.TargetName(selection.ConfigRepoSlug) + "/" + tmux.TargetName(branchSlug)
 }
 
 type worktreeArgs struct {
-	Branch  string
-	Home    string
-	Tmux    bool
-	NoCD    bool
-	NoSetup bool
+	Branch     string
+	From       string
+	Home       string
+	Workspaces bool
 }
 
 func parseWorktreeArgs(command string, args []string) (worktreeArgs, error) {
@@ -292,12 +596,8 @@ func parseWorktreeArgs(command string, args []string) (worktreeArgs, error) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
-		case arg == "--tmux":
-			parsed.Tmux = true
-		case arg == "--no-cd":
-			parsed.NoCD = true
-		case arg == "--no-setup":
-			parsed.NoSetup = true
+		case arg == "--workspaces":
+			parsed.Workspaces = true
 		case arg == "--home":
 			i++
 			if i >= len(args) {
@@ -306,6 +606,25 @@ func parseWorktreeArgs(command string, args []string) (worktreeArgs, error) {
 			parsed.Home = args[i]
 		case strings.HasPrefix(arg, "--home="):
 			parsed.Home = strings.TrimPrefix(arg, "--home=")
+		case arg == "--from":
+			if command != "new" {
+				return worktreeArgs{}, fmt.Errorf("unknown option: %s", arg)
+			}
+			i++
+			if i >= len(args) || args[i] == "" || strings.HasPrefix(args[i], "-") {
+				return worktreeArgs{}, fmt.Errorf("%s", usageFor(command))
+			}
+			parsed.From = args[i]
+		case strings.HasPrefix(arg, "--from="):
+			if command != "new" {
+				return worktreeArgs{}, fmt.Errorf("unknown option: --from")
+			}
+			parsed.From = strings.TrimPrefix(arg, "--from=")
+			if parsed.From == "" || strings.HasPrefix(parsed.From, "-") {
+				return worktreeArgs{}, fmt.Errorf("%s", usageFor(command))
+			}
+		case arg == "--tmux", arg == "--no-cd", arg == "--no-setup":
+			return worktreeArgs{}, fmt.Errorf("unknown option: %s", arg)
 		case strings.HasPrefix(arg, "-"):
 			return worktreeArgs{}, fmt.Errorf("unknown option: %s", arg)
 		default:
@@ -320,7 +639,41 @@ func parseWorktreeArgs(command string, args []string) (worktreeArgs, error) {
 }
 
 func usageFor(command string) string {
-	return fmt.Sprintf("usage: wktree %s [--tmux] [--home <path>] [--no-cd] [--no-setup] <branch>", command)
+	if command == "new" {
+		return "usage: wktree new [--home <path>] [--from <ref>] [--workspaces] <branch>"
+	}
+	return fmt.Sprintf("usage: wktree %s [--home <path>] [--workspaces] <branch>", command)
+}
+
+func runInit(ctx context.Context, args []string, options Options) (int, error) {
+	if len(args) == 1 && (args[0] == "zsh" || args[0] == "bash") {
+		return runCompletion(args, options)
+	}
+	if len(args) != 0 {
+		return 1, fmt.Errorf("usage: wktree init")
+	}
+	repoRoot, err := git.RepoRoot(ctx, options.Cwd, options.Runner)
+	if err != nil {
+		return 1, err
+	}
+	configPath, err := config.WriteProjectTemplate(repoRoot)
+	if err != nil {
+		return 1, err
+	}
+	fmt.Fprintf(options.Stdout, "created %s\n", configPath)
+	return 0, nil
+}
+
+func runCompletion(args []string, options Options) (int, error) {
+	if len(args) != 1 {
+		return 1, fmt.Errorf("usage: wktree completion <zsh|bash>")
+	}
+	initScript, err := shellinit.Generate(args[0])
+	if err != nil {
+		return 1, err
+	}
+	fmt.Fprint(options.Stdout, initScript)
+	return 0, nil
 }
 
 type listRow struct {
@@ -420,33 +773,34 @@ func HelpText() string {
 Usage:
   wktree --help
   wktree --version
+  wktree init
+  wktree doctor
   wktree list
-  wktree new [--tmux] [--home <path>] [--no-cd] [--no-setup] <branch>
-  wktree remove [--force] <branch>
-  wktree switch [--tmux] [--home <path>] [--no-cd] [--no-setup] <branch>
-  wktree init zsh
-  wktree init bash
+  wktree new [--home <path>] [--from <ref>] [--workspaces] <branch>
+  wktree remove [--force] [--dry-run] [--workspaces] <branch>
+  wktree switch [--home <path>] [--workspaces] <branch>
+  wktree completion zsh
+  wktree completion bash
 
 Examples:
+  wktree init
+  wktree doctor
   wktree list
   wktree new feature/example
-  wktree remove feature/example
-  wktree switch feature/example
-  wktree new --home /tmp/worktrees feature/example
-  wktree new --tmux feature/example
-  eval "$(wktree init zsh)"
-
-Environment:
-  WKTREE_CD_FILE        Used internally by shell integration.
+  wktree new --from main feature/example
+  wktree new --workspaces feature/example
+  wktree remove --dry-run --workspaces feature/example
+  wktree switch --workspaces feature/example
+  eval "$(wktree completion zsh)"
 
 Setup config:
-  Global:  $XDG_CONFIG_HOME/wktree/config.yaml or ~/.config/wktree/config.yaml
+  Create:  wktree init
   Project: .wktree.yaml
-  Keys:    copy, symlink, postSetup
+  Keys:    worktree_dir, tmux_mode, workspace_mode, defaults, workspaces, panes, files, hooks
 
 Shell integration:
-  eval "$(wktree init zsh)"
-  eval "$(wktree init bash)"
+  eval "$(wktree completion zsh)"
+  eval "$(wktree completion bash)"
 `
 }
 
@@ -472,6 +826,13 @@ func normalizeOptions(options Options) Options {
 		options.ShellRunner = setup.DefaultShellRunner{}
 	}
 	return options
+}
+
+func homeDir(options Options) (string, error) {
+	if options.Env != nil && options.Env["HOME"] != "" {
+		return options.Env["HOME"], nil
+	}
+	return os.UserHomeDir()
 }
 
 func envMap(env []string) map[string]string {
