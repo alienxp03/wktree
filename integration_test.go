@@ -348,6 +348,20 @@ func TestWktreeInitCreatesProjectConfig(t *testing.T) {
 	if result.exitCode == 0 || !strings.Contains(result.stderr, "config already exists") {
 		t.Fatalf("expected existing config error, status=%d stderr=%s", result.exitCode, result.stderr)
 	}
+
+	projectRoot := filepath.Join(repo.sourceRoot, "projects", "project_a")
+	must(t, os.MkdirAll(projectRoot, 0o755))
+	result = runWktree(t, binary, []string{"init"}, projectRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("project init status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	projectConfigPath := filepath.Join(projectRoot, ".wktree.yaml")
+	if _, err := os.Stat(projectConfigPath); err != nil {
+		t.Fatalf("expected project config in opened folder: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repo.sourceRoot, "projects", ".wktree.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("did not expect config in parent project folder, stat err=%v", err)
+	}
 }
 
 func TestWktreeRemoveDeletesWorktreeAndBranch(t *testing.T) {
@@ -650,6 +664,46 @@ func TestWktreeWorkspaceRepoSubdirUsesSubdirForSetup(t *testing.T) {
 	}
 	if got := envFileValue(t, read(t, filepath.Join(projectAWorktree, ".env")), "SERVER_PORT"); !isPort(got) || got == "3000" {
 		t.Fatalf("SERVER_PORT should be randomized, got %q", got)
+	}
+}
+
+func TestWktreeProjectLocalConfigUsesOpenedFolder(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	projectRoot := filepath.Join(repo.sourceRoot, "projects", "project_a")
+	must(t, os.MkdirAll(projectRoot, 0o755))
+	write(t, filepath.Join(projectRoot, "README.md"), "project A\n")
+	write(t, filepath.Join(projectRoot, ".env"), "APP_PORT=3000\n")
+	git(t, []string{"add", "projects/project_a/README.md"}, repo.sourceRoot)
+	git(t, []string{"commit", "-m", "Add project A"}, repo.sourceRoot)
+	write(t, filepath.Join(projectRoot, ".wktree.yaml"), strings.Join([]string{
+		"worktree_dir: " + repo.worktreeHome,
+		"workspaces:",
+		"  - name: project_a",
+		"    files:",
+		"      copy:",
+		"        - .env",
+		"    hooks:",
+		"      post_create:",
+		"        - pwd > cwd.txt",
+		"",
+	}, "\n"))
+	env := testEnv(t, repo.root)
+
+	result := runWktree(t, binary, []string{"new", "feature/project-local"}, projectRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("project local new status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	repoWorktree := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-project-local")
+	projectWorktree := filepath.Join(repoWorktree, "projects", "project_a")
+	if _, err := os.Stat(filepath.Join(projectWorktree, ".env")); err != nil {
+		t.Fatalf("expected .env copied into opened project folder: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoWorktree, ".env")); !os.IsNotExist(err) {
+		t.Fatalf("did not expect .env at repo worktree root, stat err=%v", err)
+	}
+	if got := read(t, filepath.Join(projectWorktree, "cwd.txt")); got != projectWorktree+"\n" {
+		t.Fatalf("hook cwd = %q, want %q", got, projectWorktree+"\n")
 	}
 }
 

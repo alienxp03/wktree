@@ -38,6 +38,8 @@ type workspaceSpec struct {
 
 type workspaceSelection struct {
 	Config         config.Config
+	ConfigPath     string
+	ConfigDir      string
 	ConfigRepoRoot string
 	ConfigRepoSlug string
 	WorktreeHome   string
@@ -185,7 +187,7 @@ func runDoctor(ctx context.Context, args []string, options Options) (int, error)
 		fmt.Fprintf(options.Stdout, "[error] config: %s\n", err)
 		status = 1
 	} else {
-		fmt.Fprintf(options.Stdout, "[ok] project config path: %s\n", config.ProjectPath(selection.ConfigRepoRoot))
+		fmt.Fprintf(options.Stdout, "[ok] project config path: %s\n", selection.ConfigPath)
 		fmt.Fprintf(options.Stdout, "[ok] config: tmux_mode=%s workspace_mode=%s workspaces=%d\n", selection.Config.TmuxMode, selection.Config.WorkspaceMode, len(selection.Workspaces))
 	}
 
@@ -485,15 +487,19 @@ func resolveWorkspaceSelection(ctx context.Context, options Options, homeOption 
 	if err != nil {
 		return workspaceSelection{}, err
 	}
-	projectConfig, err := config.LoadProject(configRepoRoot, homeDir)
+	configPath, _, err := config.FindProjectPath(options.Cwd, configRepoRoot)
 	if err != nil {
 		return workspaceSelection{}, err
 	}
+	projectConfig, err := config.LoadProjectFile(configPath, homeDir)
+	if err != nil {
+		return workspaceSelection{}, err
+	}
+	configDir := filepath.Dir(configPath)
 	if len(projectConfig.Workspaces) == 0 {
-		projectConfig.Workspaces = []config.Workspace{{Name: configRepoSlug}}
+		projectConfig.Workspaces = []config.Workspace{{Name: defaultWorkspaceName(configRepoRoot, configRepoSlug, configDir)}}
 	}
 
-	configDir := filepath.Dir(config.ProjectPath(configRepoRoot))
 	workspaces := projectConfig.Workspaces
 	selectedAllWorkspaces := allWorkspaces || projectConfig.WorkspaceMode == config.WorkspaceModeAll
 	if !selectedAllWorkspaces {
@@ -503,7 +509,7 @@ func resolveWorkspaceSelection(ctx context.Context, options Options, homeOption 
 	selected := make([]workspaceSpec, 0, len(workspaces))
 	seenRepos := map[string]string{}
 	for _, workspace := range workspaces {
-		repoPath := configRepoRoot
+		repoPath := configDir
 		if workspace.Repo != "" {
 			repoPath, err = config.ExpandConfiguredPath(workspace.Repo, homeDir, configDir)
 			if err != nil {
@@ -538,6 +544,8 @@ func resolveWorkspaceSelection(ctx context.Context, options Options, homeOption 
 
 	return workspaceSelection{
 		Config:         projectConfig,
+		ConfigPath:     configPath,
+		ConfigDir:      configDir,
 		ConfigRepoRoot: configRepoRoot,
 		ConfigRepoSlug: configRepoSlug,
 		WorktreeHome:   worktreeHome,
@@ -559,15 +567,25 @@ func resolvePullRequestWorkspaceSelection(ctx context.Context, options Options, 
 	if err != nil {
 		return workspaceSelection{}, err
 	}
-	projectConfig, err := config.LoadProject(configRepoRoot, homeDir)
+	configPath, _, err := config.FindProjectPath(options.Cwd, configRepoRoot)
 	if err != nil {
 		return workspaceSelection{}, err
 	}
+	projectConfig, err := config.LoadProjectFile(configPath, homeDir)
+	if err != nil {
+		return workspaceSelection{}, err
+	}
+	configDir := filepath.Dir(configPath)
 
-	configDir := filepath.Dir(config.ProjectPath(configRepoRoot))
 	matches := []workspaceSpec{}
 	if len(projectConfig.Workspaces) == 0 {
-		spec, err := newWorkspaceSpec(configRepoSlug, configRepoRoot, configRepoRoot, config.Workspace{Name: configRepoSlug})
+		repoPath := configDir
+		repoRoot, err := git.RepoRoot(ctx, repoPath, options.Runner)
+		if err != nil {
+			return workspaceSelection{}, err
+		}
+		name := defaultWorkspaceName(configRepoRoot, configRepoSlug, configDir)
+		spec, err := newWorkspaceSpec(name, repoRoot, repoPath, config.Workspace{Name: name})
 		if err != nil {
 			return workspaceSelection{}, err
 		}
@@ -575,7 +593,7 @@ func resolvePullRequestWorkspaceSelection(ctx context.Context, options Options, 
 	} else {
 		seenRepos := map[string]string{}
 		for _, workspace := range projectConfig.Workspaces {
-			repoPath := configRepoRoot
+			repoPath := configDir
 			if workspace.Repo != "" {
 				repoPath, err = config.ExpandConfiguredPath(workspace.Repo, homeDir, configDir)
 				if err != nil {
@@ -600,7 +618,13 @@ func resolvePullRequestWorkspaceSelection(ctx context.Context, options Options, 
 		}
 	}
 	if len(matches) == 0 {
-		spec, err := newWorkspaceSpec(configRepoSlug, configRepoRoot, configRepoRoot, config.Workspace{Name: configRepoSlug})
+		repoPath := configDir
+		repoRoot, err := git.RepoRoot(ctx, repoPath, options.Runner)
+		if err != nil {
+			return workspaceSelection{}, err
+		}
+		name := defaultWorkspaceName(configRepoRoot, configRepoSlug, configDir)
+		spec, err := newWorkspaceSpec(name, repoRoot, repoPath, config.Workspace{Name: name})
 		if err != nil {
 			return workspaceSelection{}, err
 		}
@@ -620,6 +644,8 @@ func resolvePullRequestWorkspaceSelection(ctx context.Context, options Options, 
 
 	return workspaceSelection{
 		Config:         projectConfig,
+		ConfigPath:     configPath,
+		ConfigDir:      configDir,
 		ConfigRepoRoot: configRepoRoot,
 		ConfigRepoSlug: configRepoSlug,
 		WorktreeHome:   worktreeHome,
@@ -720,6 +746,16 @@ func workspacePath(workspace workspaceSpec, worktreePath string) string {
 		return worktreePath
 	}
 	return filepath.Join(worktreePath, workspace.WorkspaceRelPath)
+}
+
+func defaultWorkspaceName(repoRoot string, repoSlug string, configDir string) string {
+	if !samePath(configDir, repoRoot) {
+		name := strings.TrimSpace(filepath.Base(filepath.Clean(configDir)))
+		if name != "" && name != "." && name != string(filepath.Separator) {
+			return name
+		}
+	}
+	return repoSlug
 }
 
 func removeGeneratedContextEnv(workspace workspaceSpec, worktreePath string) error {
@@ -875,11 +911,10 @@ func runInit(ctx context.Context, args []string, options Options) (int, error) {
 	if len(args) != 0 {
 		return 1, fmt.Errorf("usage: wktree init")
 	}
-	repoRoot, err := git.RepoRoot(ctx, options.Cwd, options.Runner)
-	if err != nil {
+	if _, err := git.RepoRoot(ctx, options.Cwd, options.Runner); err != nil {
 		return 1, err
 	}
-	configPath, err := config.WriteProjectTemplate(repoRoot)
+	configPath, err := config.WriteProjectTemplate(cleanAbsPath(options.Cwd))
 	if err != nil {
 		return 1, err
 	}
@@ -1020,7 +1055,7 @@ Examples:
 
 Setup config:
   Create:  wktree init
-  Project: .wktree.yaml
+  Project: nearest .wktree.yaml
   Keys:    worktree_dir, tmux_mode, workspace_mode, defaults, workspaces, panes, files, hooks
 
 Shell integration:

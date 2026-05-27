@@ -12,6 +12,7 @@ import (
 )
 
 const (
+	ProjectFileName      = ".wktree.yaml"
 	DefaultTmuxMode      = "window"
 	DefaultWorkspaceMode = "single"
 	WorkspaceModeAll     = "all"
@@ -70,8 +71,8 @@ type Hooks struct {
 	PostCreate []string `yaml:"post_create"`
 }
 
-func ProjectPath(repoRoot string) string {
-	return filepath.Join(repoRoot, ".wktree.yaml")
+func ProjectPath(projectDir string) string {
+	return filepath.Join(projectDir, ProjectFileName)
 }
 
 func ProjectTemplate() string {
@@ -115,8 +116,8 @@ workspaces:
 `
 }
 
-func WriteProjectTemplate(repoRoot string) (string, error) {
-	configPath := ProjectPath(repoRoot)
+func WriteProjectTemplate(projectDir string) (string, error) {
+	configPath := ProjectPath(projectDir)
 	file, err := os.OpenFile(configPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		if os.IsExist(err) {
@@ -135,8 +136,49 @@ func WriteProjectTemplate(repoRoot string) (string, error) {
 	return configPath, nil
 }
 
+func FindProjectPath(startDir string, repoRoot string) (string, bool, error) {
+	current, err := filepath.Abs(startDir)
+	if err != nil {
+		return "", false, err
+	}
+	current = filepath.Clean(current)
+	root, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return "", false, err
+	}
+	root = filepath.Clean(root)
+	relative, err := filepath.Rel(root, current)
+	if err != nil {
+		return "", false, err
+	}
+	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return "", false, fmt.Errorf("start directory must be inside git repo root: %s", startDir)
+	}
+
+	for {
+		configPath := ProjectPath(current)
+		if _, err := os.Stat(configPath); err == nil {
+			return configPath, true, nil
+		} else if !os.IsNotExist(err) {
+			return "", false, err
+		}
+		if current == root {
+			return ProjectPath(root), false, nil
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return ProjectPath(root), false, nil
+		}
+		current = parent
+	}
+}
+
 func LoadProject(repoRoot string, homeDir string) (Config, error) {
-	config, err := LoadFile(ProjectPath(repoRoot), homeDir)
+	return LoadProjectFile(ProjectPath(repoRoot), homeDir)
+}
+
+func LoadProjectFile(configPath string, homeDir string) (Config, error) {
+	config, err := LoadFile(configPath, homeDir)
 	if err != nil {
 		return Config{}, err
 	}

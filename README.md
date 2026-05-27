@@ -72,17 +72,19 @@ For GitHub remotes, `owner_slug` and `repo_slug` come from the remote URL. Witho
 
 ## Config
 
-`wktree` reads only the project-local config:
+`wktree` searches from the current directory up to the Git root and uses the nearest project-local config:
 
 ```text
 .wktree.yaml
 ```
 
-Create a starter config in the current Git repository with:
+Create a starter config in the current directory with:
 
 ```bash
 wktree init
 ```
+
+In a monorepo, this means `wktree init` can be run from an inner project folder. Git worktree operations still use the Git repo root, while setup files, hooks, pane commands, and terminal cwd use the configured project folder in the new worktree.
 
 Single-repo example:
 
@@ -127,7 +129,7 @@ workspace_mode: all
 
 workspaces:
   - name: backend
-    # repo omitted, so this workspace uses the current repo
+    # repo omitted, so this workspace uses the config directory
     files:
       copy:
         - .env.backend
@@ -166,7 +168,7 @@ workspaces:
 
 All-workspace runs always use a branch-scoped tmux session, regardless of `tmux_mode`. `tmux_mode` only controls single-workspace runs.
 
-Each workspace becomes a tmux window. If `repo` is omitted, the workspace uses the current repo. If `repo` points inside a Git repo, Git worktree operations still use the repo root, but setup files, hooks, pane commands, and `WKTREE_<NAME>_DIR` use the matching subdirectory in the new worktree. Each `panes` item is one tmux pane. A pane can run either one `command` or multiple `commands`; multiple commands run in the same pane with `&&`.
+Each workspace becomes a tmux window. If `repo` is omitted, the workspace uses the directory containing `.wktree.yaml`. If `repo` points inside a Git repo, Git worktree operations still use the repo root, but setup files, hooks, pane commands, and `WKTREE_<NAME>_DIR` use the matching subdirectory in the new worktree. Each `panes` item is one tmux pane. A pane can run either one `command` or multiple `commands`; multiple commands run in the same pane with `&&`.
 
 `defaults.files` applies to every selected workspace first. Workspace-level `files` appends after those defaults. Hooks are workspace-specific and run before tmux opens.
 

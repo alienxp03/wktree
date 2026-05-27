@@ -50,6 +50,43 @@ func TestWriteProjectTemplateRefusesExistingConfig(t *testing.T) {
 	}
 }
 
+func TestFindProjectPathUsesNearestConfigWithinRepo(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "projects", "project_a")
+	startDir := filepath.Join(projectRoot, "src")
+	must(t, os.MkdirAll(startDir, 0o755))
+	rootConfig := filepath.Join(root, ".wktree.yaml")
+	projectConfig := filepath.Join(projectRoot, ".wktree.yaml")
+	write(t, rootConfig, "workspaces:\n  - name: root\n")
+	write(t, projectConfig, "workspaces:\n  - name: project_a\n")
+
+	got, found, err := FindProjectPath(startDir, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || got != projectConfig {
+		t.Fatalf("project config = %q found=%v", got, found)
+	}
+
+	must(t, os.Remove(projectConfig))
+	got, found, err = FindProjectPath(startDir, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || got != rootConfig {
+		t.Fatalf("root config = %q found=%v", got, found)
+	}
+
+	must(t, os.Remove(rootConfig))
+	got, found, err = FindProjectPath(startDir, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found || got != rootConfig {
+		t.Fatalf("missing config = %q found=%v", got, found)
+	}
+}
+
 func TestLoadProjectConfig(t *testing.T) {
 	root := t.TempDir()
 	sourceRoot := filepath.Join(root, "source")
