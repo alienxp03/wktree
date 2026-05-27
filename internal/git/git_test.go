@@ -66,3 +66,14 @@ func TestNormalizePullRequestValue(t *testing.T) {
 		t.Fatal("normalizePullRequestValue should reject non-numeric non-URL values")
 	}
 }
+
+func TestGeneratedStatusLineMatchesNestedContextEnv(t *testing.T) {
+	for _, line := range []string{"?? .wktree.env", "?? projects/project_a/.wktree.env", " M apps/app_a/.wktree.env"} {
+		if !isGeneratedStatusLine(line) {
+			t.Fatalf("expected generated status line: %q", line)
+		}
+	}
+	if isGeneratedStatusLine("?? .env") {
+		t.Fatal(".env should not be treated as generated")
+	}
+}

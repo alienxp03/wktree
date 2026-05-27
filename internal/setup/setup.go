@@ -45,6 +45,7 @@ type PullRequestContext struct {
 type Logger struct {
 	Stdout io.Writer
 	Stderr io.Writer
+	Prefix string
 }
 
 type ShellRunner interface {
@@ -93,9 +94,10 @@ func NewPlan(repoRoot string, worktreePath string, workspaceName string, branch 
 }
 
 func Run(ctx context.Context, plan Plan, logger Logger, shellRunner ShellRunner) int {
+	existingRandomizeFiles := existingRandomizeDestinations(plan)
 	copyStatus := CopyFiles(plan, logger)
 	symlinkStatus := SymlinkFiles(plan, logger)
-	randomizeStatus := RandomizeEnvPorts(plan, logger, AllocateLocalPort)
+	randomizeStatus := randomizeEnvPorts(plan, logger, AllocateLocalPort, existingRandomizeFiles)
 	contextStatus := 0
 	if err := WriteContextEnv(plan); err != nil {
 		logger.Warn("failed to write workspace env: %s", err)
@@ -203,6 +205,10 @@ func SymlinkFiles(plan Plan, logger Logger) int {
 type PortAllocator func() (int, error)
 
 func RandomizeEnvPorts(plan Plan, logger Logger, allocate PortAllocator) int {
+	return randomizeEnvPorts(plan, logger, allocate, nil)
+}
+
+func randomizeEnvPorts(plan Plan, logger Logger, allocate PortAllocator, existingFiles map[string]bool) int {
 	if allocate == nil {
 		allocate = AllocateLocalPort
 	}
@@ -225,7 +231,11 @@ func RandomizeEnvPorts(plan Plan, logger Logger, allocate PortAllocator) int {
 			status = 1
 			continue
 		}
-		updated, changed, err := renderRandomizedEnv(string(source), item.Vars, used, allocate, plan.PreserveRandomPorts)
+		preserveExisting := plan.PreserveRandomPorts
+		if existingFiles != nil {
+			preserveExisting = preserveExisting && existingFiles[item.File]
+		}
+		updated, changed, err := renderRandomizedEnv(string(source), item.Vars, used, allocate, preserveExisting)
 		if err != nil {
 			logger.Warn("failed to randomize ports in %s: %s", item.File, err)
 			status = 1
@@ -248,6 +258,15 @@ func RandomizeEnvPorts(plan Plan, logger Logger, allocate PortAllocator) int {
 		logger.Info("randomized ports in %s", item.File)
 	}
 	return status
+}
+
+func existingRandomizeDestinations(plan Plan) map[string]bool {
+	existing := map[string]bool{}
+	for _, item := range plan.RandomizePorts {
+		destinationPath := filepath.Join(plan.WorktreePath, item.File)
+		existing[item.File] = isWithin(plan.WorktreePath, destinationPath) && pathExists(destinationPath)
+	}
+	return existing
 }
 
 func AllocateLocalPort() (int, error) {
@@ -554,7 +573,7 @@ func (logger Logger) Info(format string, args ...any) {
 	if writer == nil {
 		writer = os.Stdout
 	}
-	fmt.Fprintf(writer, format+"\n", args...)
+	fmt.Fprintf(writer, logger.prefix()+format+"\n", args...)
 }
 
 func (logger Logger) Warn(format string, args ...any) {
@@ -562,7 +581,14 @@ func (logger Logger) Warn(format string, args ...any) {
 	if writer == nil {
 		writer = os.Stderr
 	}
-	fmt.Fprintf(writer, "warning: "+format+"\n", args...)
+	fmt.Fprintf(writer, "warning: "+logger.prefix()+format+"\n", args...)
+}
+
+func (logger Logger) prefix() string {
+	if logger.Prefix == "" {
+		return ""
+	}
+	return logger.Prefix + ": "
 }
 
 func validateRelativePaths(values []string, key string, filePath string) error {

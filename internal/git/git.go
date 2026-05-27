@@ -542,7 +542,7 @@ func isGeneratedStatusLine(line string) bool {
 	if len(line) < 4 {
 		return false
 	}
-	return strings.TrimSpace(line[3:]) == ".wktree.env"
+	return filepath.Base(strings.TrimSpace(line[3:])) == ".wktree.env"
 }
 
 func samePath(left string, right string) bool {

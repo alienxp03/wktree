@@ -29,9 +29,11 @@ type Options struct {
 }
 
 type workspaceSpec struct {
-	Name     string
-	RepoRoot string
-	Config   config.Workspace
+	Name             string
+	RepoRoot         string
+	WorkspaceRoot    string
+	WorkspaceRelPath string
+	Config           config.Workspace
 }
 
 type workspaceSelection struct {
@@ -285,7 +287,7 @@ func runSwitchPullRequest(ctx context.Context, parsed worktreeArgs, options Opti
 	if err != nil {
 		return 1, fmt.Errorf("%s: %w", selection.Workspaces[0].Name, err)
 	}
-	if err := ensurePullRequestTargetManaged(target); err != nil {
+	if err := ensurePullRequestTargetManaged(selection.Workspaces[0], target); err != nil {
 		return 1, fmt.Errorf("%s: %w", selection.Workspaces[0].Name, err)
 	}
 	worktree, err := git.OpenPullRequestWorktree(ctx, target, options.Runner)
@@ -322,7 +324,7 @@ func runRemove(ctx context.Context, args []string, options Options) (int, error)
 		targets = append(targets, target)
 	}
 	if !selection.AllWorkspaces {
-		if err := ensureSingleWorkspaceRemove(parsed.Branch, targets[0]); err != nil {
+		if err := ensureSingleWorkspaceRemove(parsed.Branch, selection.Workspaces[0], targets[0]); err != nil {
 			return 1, err
 		}
 	}
@@ -337,13 +339,15 @@ func runRemove(ctx context.Context, args []string, options Options) (int, error)
 			}
 		}
 	}
+	for index, target := range targets {
+		if err := removeGeneratedContextEnv(selection.Workspaces[index], target.WorktreePath); err != nil {
+			return 1, fmt.Errorf("%s: %w", selection.Workspaces[index].Name, err)
+		}
+	}
 	if err := killWorkspaceTmux(ctx, selection, parsed.Branch, options); err != nil {
 		return 1, err
 	}
 	for index, target := range targets {
-		if err := setup.RemoveContextEnv(target.WorktreePath); err != nil {
-			return 1, fmt.Errorf("%s: %w", selection.Workspaces[index].Name, err)
-		}
 		if err := git.RemoveWorktree(ctx, target, parsed.Force, options.Runner); err != nil {
 			return 1, fmt.Errorf("%s: %w", selection.Workspaces[index].Name, err)
 		}
@@ -417,14 +421,15 @@ func finishWorkspaceCommand(ctx context.Context, selection workspaceSelection, b
 
 func finishWorkspaceCommandWithContext(ctx context.Context, selection workspaceSelection, branch string, worktrees []workspaceWorktree, prContext *setup.PullRequestContext, options Options) (int, error) {
 	contexts := workspaceContexts(branch, worktrees)
-	logger := setup.Logger{Stdout: options.Stdout, Stderr: options.Stderr}
+	baseLogger := setup.Logger{Stdout: options.Stdout, Stderr: options.Stderr}
 	status := 0
 	for _, worktree := range worktrees {
 		files := config.WorkspaceFiles(selection.Config, worktree.Spec.Config)
 		hooks := config.WorkspaceHooks(selection.Config, worktree.Spec.Config)
 		context := contexts[worktree.Spec.Name]
 		context.PullRequest = prContext
-		plan := setup.NewPlan(worktree.Worktree.RepoRoot, worktree.Worktree.WorktreePath, worktree.Spec.Name, branch, files, hooks, worktree.Spec.Config.RandomizePorts, worktree.Worktree.Reused, context)
+		plan := setup.NewPlan(worktree.Spec.WorkspaceRoot, workspacePath(worktree.Spec, worktree.Worktree.WorktreePath), worktree.Spec.Name, branch, files, hooks, worktree.Spec.Config.RandomizePorts, worktree.Worktree.Reused, context)
+		logger := workspaceLogger(baseLogger, selection, worktree.Spec)
 		if setup.Run(ctx, plan, logger, options.ShellRunner) != 0 {
 			status = 1
 		}
@@ -446,11 +451,18 @@ func finishWorkspaceCommandWithContext(ctx context.Context, selection workspaceS
 	return openStatus, nil
 }
 
-func ensurePullRequestTargetManaged(target git.PullRequestTarget) error {
+func workspaceLogger(base setup.Logger, selection workspaceSelection, workspace workspaceSpec) setup.Logger {
+	if len(selection.Workspaces) > 1 || selection.AllWorkspaces {
+		base.Prefix = workspace.Name
+	}
+	return base
+}
+
+func ensurePullRequestTargetManaged(workspace workspaceSpec, target git.PullRequestTarget) error {
 	if !target.BranchExists {
 		return nil
 	}
-	context, ok, err := setup.ReadPullRequestContext(target.Worktree.WorktreePath)
+	context, ok, err := setup.ReadPullRequestContext(workspacePath(workspace, target.Worktree.WorktreePath))
 	if err != nil {
 		return err
 	}
@@ -506,7 +518,11 @@ func resolveWorkspaceSelection(ctx context.Context, options Options, homeOption 
 			return workspaceSelection{}, fmt.Errorf("workspaces %q and %q resolve to the same repo: %s", previous, workspace.Name, repoRoot)
 		}
 		seenRepos[cleanAbsPath(repoRoot)] = workspace.Name
-		selected = append(selected, workspaceSpec{Name: workspace.Name, RepoRoot: repoRoot, Config: workspace})
+		spec, err := newWorkspaceSpec(workspace.Name, repoRoot, repoPath, workspace)
+		if err != nil {
+			return workspaceSelection{}, fmt.Errorf("%s repo: %w", workspace.Name, err)
+		}
+		selected = append(selected, spec)
 	}
 
 	worktreeHome := homeOption
@@ -551,7 +567,11 @@ func resolvePullRequestWorkspaceSelection(ctx context.Context, options Options, 
 	configDir := filepath.Dir(config.ProjectPath(configRepoRoot))
 	matches := []workspaceSpec{}
 	if len(projectConfig.Workspaces) == 0 {
-		matches = append(matches, workspaceSpec{Name: configRepoSlug, RepoRoot: configRepoRoot, Config: config.Workspace{Name: configRepoSlug}})
+		spec, err := newWorkspaceSpec(configRepoSlug, configRepoRoot, configRepoRoot, config.Workspace{Name: configRepoSlug})
+		if err != nil {
+			return workspaceSelection{}, err
+		}
+		matches = append(matches, spec)
 	} else {
 		seenRepos := map[string]string{}
 		for _, workspace := range projectConfig.Workspaces {
@@ -571,12 +591,20 @@ func resolvePullRequestWorkspaceSelection(ctx context.Context, options Options, 
 			}
 			seenRepos[cleanAbsPath(repoRoot)] = workspace.Name
 			if samePath(repoRoot, configRepoRoot) {
-				matches = append(matches, workspaceSpec{Name: workspace.Name, RepoRoot: repoRoot, Config: workspace})
+				spec, err := newWorkspaceSpec(workspace.Name, repoRoot, repoPath, workspace)
+				if err != nil {
+					return workspaceSelection{}, fmt.Errorf("%s repo: %w", workspace.Name, err)
+				}
+				matches = append(matches, spec)
 			}
 		}
 	}
 	if len(matches) == 0 {
-		matches = append(matches, workspaceSpec{Name: configRepoSlug, RepoRoot: configRepoRoot, Config: config.Workspace{Name: configRepoSlug}})
+		spec, err := newWorkspaceSpec(configRepoSlug, configRepoRoot, configRepoRoot, config.Workspace{Name: configRepoSlug})
+		if err != nil {
+			return workspaceSelection{}, err
+		}
+		matches = append(matches, spec)
 	}
 
 	worktreeHome := homeOption
@@ -603,7 +631,7 @@ func resolvePullRequestWorkspaceSelection(ctx context.Context, options Options, 
 func workspaceContexts(branch string, worktrees []workspaceWorktree) map[string]setup.Context {
 	workspacePaths := map[string]string{}
 	for _, worktree := range worktrees {
-		workspacePaths[worktree.Spec.Name] = worktree.Worktree.WorktreePath
+		workspacePaths[worktree.Spec.Name] = workspacePath(worktree.Spec, worktree.Worktree.WorktreePath)
 	}
 	contexts := map[string]setup.Context{}
 	for _, worktree := range worktrees {
@@ -619,7 +647,7 @@ func tmuxWindows(selection workspaceSelection, branch string, worktrees []worksp
 	for _, worktree := range worktrees {
 		windows = append(windows, tmux.Window{
 			Name:         workspaceWindowName(worktree.Spec.Name),
-			WorktreePath: worktree.Worktree.WorktreePath,
+			WorktreePath: workspacePath(worktree.Spec, worktree.Worktree.WorktreePath),
 			Commands:     paneCommands(config.WorkspacePanes(worktree.Spec.Config)),
 		})
 	}
@@ -654,8 +682,8 @@ func killWorkspaceTmux(ctx context.Context, selection workspaceSelection, branch
 	})
 }
 
-func ensureSingleWorkspaceRemove(branch string, target git.RemoveTarget) error {
-	count, err := setup.ContextEnvWorkspaceDirCount(target.WorktreePath)
+func ensureSingleWorkspaceRemove(branch string, workspace workspaceSpec, target git.RemoveTarget) error {
+	count, err := setup.ContextEnvWorkspaceDirCount(workspacePath(workspace, target.WorktreePath))
 	if err != nil {
 		return err
 	}
@@ -663,6 +691,46 @@ func ensureSingleWorkspaceRemove(branch string, target git.RemoveTarget) error {
 		return fmt.Errorf("branch appears to use multiple workspaces from .wktree.env; rerun with --workspaces to remove all: %s", branch)
 	}
 	return nil
+}
+
+func newWorkspaceSpec(name string, repoRoot string, workspaceRoot string, workspace config.Workspace) (workspaceSpec, error) {
+	absoluteRoot := cleanAbsPath(repoRoot)
+	absoluteWorkspace := cleanAbsPath(workspaceRoot)
+	relative, err := filepath.Rel(absoluteRoot, absoluteWorkspace)
+	if err != nil {
+		return workspaceSpec{}, err
+	}
+	if relative == "." {
+		relative = ""
+	}
+	if relative != "" && (relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative)) {
+		return workspaceSpec{}, fmt.Errorf("path must be inside git repo root: %s", workspaceRoot)
+	}
+	return workspaceSpec{
+		Name:             name,
+		RepoRoot:         repoRoot,
+		WorkspaceRoot:    absoluteWorkspace,
+		WorkspaceRelPath: relative,
+		Config:           workspace,
+	}, nil
+}
+
+func workspacePath(workspace workspaceSpec, worktreePath string) string {
+	if workspace.WorkspaceRelPath == "" {
+		return worktreePath
+	}
+	return filepath.Join(worktreePath, workspace.WorkspaceRelPath)
+}
+
+func removeGeneratedContextEnv(workspace workspaceSpec, worktreePath string) error {
+	workspaceDir := workspacePath(workspace, worktreePath)
+	if err := setup.RemoveContextEnv(workspaceDir); err != nil {
+		return err
+	}
+	if samePath(workspaceDir, worktreePath) {
+		return nil
+	}
+	return setup.RemoveContextEnv(worktreePath)
 }
 
 func tmuxRemovalActions(selection workspaceSelection, branch string) []string {

@@ -486,6 +486,9 @@ func TestWktreeNewAndRemoveWorkspaces(t *testing.T) {
 	if result.exitCode != 0 {
 		t.Fatalf("new workspaces status=%d stderr=%s", result.exitCode, result.stderr)
 	}
+	if strings.Contains(result.stdout, "backend:") || strings.Contains(result.stdout, "frontend:") {
+		t.Fatalf("unexpected workspace setup logs without setup actions:\n%s", result.stdout)
+	}
 	backendPath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-full")
 	frontendPath := filepath.Join(repo.worktreeHome, "alienxp03", "frontend", "feature-full")
 	for _, item := range []struct {
@@ -582,6 +585,71 @@ func TestWktreeRemoveRequiresWorkspacesForMultiWorkspaceEnv(t *testing.T) {
 	}
 	if got := git(t, []string{"branch", "--list", "feature/guard"}, frontendRoot); got != "" {
 		t.Fatalf("frontend branch still exists: %q", got)
+	}
+}
+
+func TestWktreeWorkspaceRepoSubdirUsesSubdirForSetup(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	repoBRoot := createSiblingRepo(t, repo.root, "repo_b", "repo-b")
+	projectARoot := filepath.Join(repoBRoot, "projects", "project_a")
+	must(t, os.MkdirAll(projectARoot, 0o755))
+	write(t, filepath.Join(projectARoot, ".env"), "SERVER_PORT=3000\n")
+	write(t, filepath.Join(projectARoot, "AGENTS.override.md"), "project A agents\n")
+	write(t, filepath.Join(projectARoot, "README.md"), "project A\n")
+	git(t, []string{"add", "projects/project_a/README.md"}, repoBRoot)
+	git(t, []string{"commit", "-m", "Add project A"}, repoBRoot)
+	env := testEnv(t, repo.root)
+	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
+		"worktree_dir: " + repo.worktreeHome,
+		"workspace_mode: all",
+		"workspaces:",
+		"  - name: repo_a",
+		"  - name: project_a",
+		"    repo: ../repo_b/projects/project_a",
+		"    randomize_ports:",
+		"      - file: .env",
+		"        vars:",
+		"          - SERVER_PORT",
+		"    hooks:",
+		"      post_create:",
+		"        - pwd > cwd.txt",
+		"defaults:",
+		"  files:",
+		"    copy:",
+		"      - .env",
+		"    symlink:",
+		"      - AGENTS.override.md",
+		"",
+	}, "\n"))
+
+	result := runWktree(t, binary, []string{"new", "feature/subdir"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("new subdir workspace status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	for _, want := range []string{"project_a: copied .env", "project_a: symlinked AGENTS.override.md", "project_a: randomized ports in .env", "project_a: $ pwd > cwd.txt"} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("setup log missing %q:\n%s", want, result.stdout)
+		}
+	}
+	repoBWorktree := filepath.Join(repo.worktreeHome, "alienxp03", "repo-b", "feature-subdir")
+	projectAWorktree := filepath.Join(repoBWorktree, "projects", "project_a")
+	if _, err := os.Stat(filepath.Join(projectAWorktree, ".env")); err != nil {
+		t.Fatalf("expected project A .env copied into workspace subdir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoBWorktree, ".env")); !os.IsNotExist(err) {
+		t.Fatalf("did not expect .env at repo B worktree root, stat err=%v", err)
+	}
+	assertSymlinkTarget(t, filepath.Join(projectAWorktree, "AGENTS.override.md"), filepath.Join(projectARoot, "AGENTS.override.md"))
+	if got := read(t, filepath.Join(projectAWorktree, "cwd.txt")); got != projectAWorktree+"\n" {
+		t.Fatalf("hook cwd = %q, want %q", got, projectAWorktree+"\n")
+	}
+	envFile := read(t, filepath.Join(projectAWorktree, ".wktree.env"))
+	if !strings.Contains(envFile, "WKTREE_PROJECT_A_DIR=") || !strings.Contains(envFile, projectAWorktree) {
+		t.Fatalf("project A env should point at workspace subdir:\n%s", envFile)
+	}
+	if got := envFileValue(t, read(t, filepath.Join(projectAWorktree, ".env")), "SERVER_PORT"); !isPort(got) || got == "3000" {
+		t.Fatalf("SERVER_PORT should be randomized, got %q", got)
 	}
 }
 

@@ -166,7 +166,7 @@ workspaces:
 
 All-workspace runs always use a branch-scoped tmux session, regardless of `tmux_mode`. `tmux_mode` only controls single-workspace runs.
 
-Each workspace becomes a tmux window. If `repo` is omitted, the workspace uses the current repo. Each `panes` item is one tmux pane. A pane can run either one `command` or multiple `commands`; multiple commands run in the same pane with `&&`.
+Each workspace becomes a tmux window. If `repo` is omitted, the workspace uses the current repo. If `repo` points inside a Git repo, Git worktree operations still use the repo root, but setup files, hooks, pane commands, and `WKTREE_<NAME>_DIR` use the matching subdirectory in the new worktree. Each `panes` item is one tmux pane. A pane can run either one `command` or multiple `commands`; multiple commands run in the same pane with `&&`.
 
 `defaults.files` applies to every selected workspace first. Workspace-level `files` appends after those defaults. Hooks are workspace-specific and run before tmux opens.
 

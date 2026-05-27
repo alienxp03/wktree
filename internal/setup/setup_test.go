@@ -41,6 +41,21 @@ func TestCopyFiles(t *testing.T) {
 	}
 }
 
+func TestLoggerPrefixesMessages(t *testing.T) {
+	logger, stdout, stderr := captureLogger()
+	logger.Prefix = "project_a"
+
+	logger.Info("copied %s", ".env")
+	logger.Warn("copy destination already exists, skipping: %s", ".env")
+
+	if got := stdout.String(); got != "project_a: copied .env\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+	if got := stderr.String(); got != "warning: project_a: copy destination already exists, skipping: .env\n" {
+		t.Fatalf("stderr = %q", got)
+	}
+}
+
 func TestCopyFilesDoesNotOverwrite(t *testing.T) {
 	root := t.TempDir()
 	repoRoot := filepath.Join(root, "source")
@@ -287,6 +302,35 @@ func TestRandomizeEnvPortsPreservesExistingPortsWhenReused(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("env missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestRunRandomizesNewlyCopiedEnvWhenReused(t *testing.T) {
+	root := t.TempDir()
+	repoRoot := filepath.Join(root, "repo")
+	worktreePath := filepath.Join(root, "worktree")
+	must(t, os.MkdirAll(repoRoot, 0o755))
+	must(t, os.MkdirAll(worktreePath, 0o755))
+	write(t, filepath.Join(repoRoot, ".env"), "PORT=1\n")
+
+	status := Run(context.Background(), Plan{
+		RepoRoot:            repoRoot,
+		WorktreePath:        worktreePath,
+		Copy:                []string{".env"},
+		PreserveRandomPorts: true,
+		RandomizePorts: []config.RandomizePort{
+			{File: ".env", Vars: []string{"PORT"}},
+		},
+		Context: Context{WorkspacePaths: map[string]string{"app": worktreePath}},
+	}, Logger{}, ShellRunnerFunc(func(context.Context, string, string, bool) run.Result {
+		return run.Result{}
+	}))
+
+	if status != 0 {
+		t.Fatalf("status = %d", status)
+	}
+	if got := strings.TrimSpace(read(t, filepath.Join(worktreePath, ".env"))); got == "PORT=1" || !strings.HasPrefix(got, "PORT=") {
+		t.Fatalf("newly copied env should be randomized:\n%s", got)
 	}
 }
 
