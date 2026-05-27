@@ -51,3 +51,18 @@ func TestRepoSlugRequiresUserNameWithoutGitHubRemote(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestNormalizePullRequestValue(t *testing.T) {
+	for _, input := range []string{"123", "https://github.com/alienxp03/demo/pull/123"} {
+		got, err := normalizePullRequestValue(input)
+		if err != nil {
+			t.Fatalf("normalizePullRequestValue(%q) returned error: %v", input, err)
+		}
+		if got != input {
+			t.Fatalf("normalizePullRequestValue(%q) = %q", input, got)
+		}
+	}
+	if _, err := normalizePullRequestValue("feature/example"); err == nil {
+		t.Fatal("normalizePullRequestValue should reject non-numeric non-URL values")
+	}
+}

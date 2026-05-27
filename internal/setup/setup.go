@@ -32,6 +32,14 @@ type Plan struct {
 
 type Context struct {
 	WorkspacePaths map[string]string
+	PullRequest    *PullRequestContext
+}
+
+type PullRequestContext struct {
+	Number  int
+	URL     string
+	HeadRef string
+	HeadSHA string
 }
 
 type Logger struct {
@@ -417,6 +425,12 @@ func RenderContextEnv(context Context) (string, error) {
 		}
 		values[key] = absolute
 	}
+	if context.PullRequest != nil {
+		values["WKTREE_PR_NUMBER"] = strconv.Itoa(context.PullRequest.Number)
+		values["WKTREE_PR_URL"] = context.PullRequest.URL
+		values["WKTREE_PR_HEAD_REF"] = context.PullRequest.HeadRef
+		values["WKTREE_PR_HEAD_SHA"] = context.PullRequest.HeadSHA
+	}
 
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -429,6 +443,38 @@ func RenderContextEnv(context Context) (string, error) {
 		fmt.Fprintf(&output, "export %s=%s\n", key, shellQuote(values[key]))
 	}
 	return output.String(), nil
+}
+
+func ReadPullRequestContext(worktreePath string) (PullRequestContext, bool, error) {
+	source, err := os.ReadFile(ContextEnvPath(worktreePath))
+	if os.IsNotExist(err) {
+		return PullRequestContext{}, false, nil
+	}
+	if err != nil {
+		return PullRequestContext{}, false, err
+	}
+
+	values := map[string]string{}
+	for _, line := range strings.Split(string(source), "\n") {
+		key, value, ok := exportedEnvValue(strings.TrimSpace(line))
+		if ok {
+			values[key] = value
+		}
+	}
+	numberValue, ok := values["WKTREE_PR_NUMBER"]
+	if !ok {
+		return PullRequestContext{}, false, nil
+	}
+	number, err := strconv.Atoi(numberValue)
+	if err != nil {
+		return PullRequestContext{}, false, fmt.Errorf("invalid WKTREE_PR_NUMBER in %s: %w", ContextEnvPath(worktreePath), err)
+	}
+	return PullRequestContext{
+		Number:  number,
+		URL:     values["WKTREE_PR_URL"],
+		HeadRef: values["WKTREE_PR_HEAD_REF"],
+		HeadSHA: values["WKTREE_PR_HEAD_SHA"],
+	}, true, nil
 }
 
 func RunPostCreate(ctx context.Context, plan Plan, logger Logger, shellRunner ShellRunner) int {
@@ -480,6 +526,27 @@ func isContextWorkspaceDirLine(line string) bool {
 		}
 	}
 	return len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\''
+}
+
+func exportedEnvValue(line string) (string, string, bool) {
+	const prefix = "export "
+	if !strings.HasPrefix(line, prefix) {
+		return "", "", false
+	}
+	key, value, ok := strings.Cut(strings.TrimPrefix(line, prefix), "=")
+	if !ok || strings.TrimSpace(key) == "" {
+		return "", "", false
+	}
+	return strings.TrimSpace(key), shellUnquote(value), true
+}
+
+func shellUnquote(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'") {
+		inner := value[1 : len(value)-1]
+		return strings.ReplaceAll(inner, "'\\''", "'")
+	}
+	return strings.Trim(value, `"'`)
 }
 
 func (logger Logger) Info(format string, args ...any) {

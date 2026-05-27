@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -17,6 +18,7 @@ var (
 		regexp.MustCompile(`^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?/?$`),
 		regexp.MustCompile(`^ssh://git@github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$`),
 	}
+	githubPullURL = regexp.MustCompile(`^https?://github\.com/([^/]+)/([^/]+)/pull/([0-9]+)(?:[/?#].*)?$`)
 )
 
 func StripOriginPrefix(branch string) string {
@@ -53,6 +55,26 @@ func ParseGitHubRemote(remoteURL string) (string, bool, error) {
 		return filepath.Join(org, repo), true, nil
 	}
 	return "", false, nil
+}
+
+func ParseGitHubPullURL(pullURL string) (string, int, bool, error) {
+	matches := githubPullURL.FindStringSubmatch(strings.TrimSpace(pullURL))
+	if matches == nil {
+		return "", 0, false, nil
+	}
+	org, err := PathSlugPart(matches[1])
+	if err != nil {
+		return "", 0, false, err
+	}
+	repo, err := PathSlugPart(matches[2])
+	if err != nil {
+		return "", 0, false, err
+	}
+	number, err := strconv.Atoi(matches[3])
+	if err != nil {
+		return "", 0, false, err
+	}
+	return filepath.Join(org, repo), number, true, nil
 }
 
 func RepoDirectorySlug(repoRoot string, owner string) (string, error) {

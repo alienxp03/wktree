@@ -119,7 +119,7 @@ func runComplete(ctx context.Context, args []string, options Options) (int, erro
 			values, err = git.CompleteRemoveBranches(ctx, options.Cwd, prefix, options.Runner)
 		}
 	case "switch":
-		values, err = completeWorktreeCommand(ctx, options, prefix, []string{"--home", "--workspaces"})
+		values, err = completeWorktreeCommand(ctx, options, prefix, []string{"--home", "--workspaces", "--pr"})
 	default:
 		values = filterPrefix([]string{"doctor", "list", "new", "remove", "switch", "init", "completion"}, prefix)
 	}
@@ -238,6 +238,9 @@ func runSwitch(ctx context.Context, args []string, options Options) (int, error)
 	if err != nil {
 		return 1, err
 	}
+	if parsed.PullRequest != "" {
+		return runSwitchPullRequest(ctx, parsed, options)
+	}
 	selection, err := resolveWorkspaceSelection(ctx, options, parsed.Home, parsed.Workspaces)
 	if err != nil {
 		return 1, err
@@ -266,6 +269,38 @@ func runSwitch(ctx context.Context, args []string, options Options) (int, error)
 		worktrees = append(worktrees, workspaceWorktree{Spec: selection.Workspaces[index], Worktree: worktree})
 	}
 	return finishWorkspaceCommand(ctx, selection, parsed.Branch, worktrees, options)
+}
+
+func runSwitchPullRequest(ctx context.Context, parsed worktreeArgs, options Options) (int, error) {
+	selection, err := resolvePullRequestWorkspaceSelection(ctx, options, parsed.Home)
+	if err != nil {
+		return 1, err
+	}
+	target, err := git.ResolvePullRequestWorktree(ctx, git.PullRequestOptions{
+		Value:      parsed.PullRequest,
+		HomeOption: selection.WorktreeHome,
+		Cwd:        selection.Workspaces[0].RepoRoot,
+		Runner:     options.Runner,
+	})
+	if err != nil {
+		return 1, fmt.Errorf("%s: %w", selection.Workspaces[0].Name, err)
+	}
+	if err := ensurePullRequestTargetManaged(target); err != nil {
+		return 1, fmt.Errorf("%s: %w", selection.Workspaces[0].Name, err)
+	}
+	worktree, err := git.OpenPullRequestWorktree(ctx, target, options.Runner)
+	if err != nil {
+		return 1, fmt.Errorf("%s: %w", selection.Workspaces[0].Name, err)
+	}
+
+	prContext := &setup.PullRequestContext{
+		Number:  target.PullRequest.Number,
+		URL:     target.PullRequest.URL,
+		HeadRef: target.PullRequest.HeadRefName,
+		HeadSHA: target.PullRequest.HeadRefOID,
+	}
+	worktrees := []workspaceWorktree{{Spec: selection.Workspaces[0], Worktree: worktree}}
+	return finishWorkspaceCommandWithContext(ctx, selection, worktree.Branch, worktrees, prContext, options)
 }
 
 func runRemove(ctx context.Context, args []string, options Options) (int, error) {
@@ -377,13 +412,19 @@ func renderRemoveDryRun(selection workspaceSelection, branch string, targets []g
 }
 
 func finishWorkspaceCommand(ctx context.Context, selection workspaceSelection, branch string, worktrees []workspaceWorktree, options Options) (int, error) {
+	return finishWorkspaceCommandWithContext(ctx, selection, branch, worktrees, nil, options)
+}
+
+func finishWorkspaceCommandWithContext(ctx context.Context, selection workspaceSelection, branch string, worktrees []workspaceWorktree, prContext *setup.PullRequestContext, options Options) (int, error) {
 	contexts := workspaceContexts(branch, worktrees)
 	logger := setup.Logger{Stdout: options.Stdout, Stderr: options.Stderr}
 	status := 0
 	for _, worktree := range worktrees {
 		files := config.WorkspaceFiles(selection.Config, worktree.Spec.Config)
 		hooks := config.WorkspaceHooks(selection.Config, worktree.Spec.Config)
-		plan := setup.NewPlan(worktree.Worktree.RepoRoot, worktree.Worktree.WorktreePath, worktree.Spec.Name, branch, files, hooks, worktree.Spec.Config.RandomizePorts, worktree.Worktree.Reused, contexts[worktree.Spec.Name])
+		context := contexts[worktree.Spec.Name]
+		context.PullRequest = prContext
+		plan := setup.NewPlan(worktree.Worktree.RepoRoot, worktree.Worktree.WorktreePath, worktree.Spec.Name, branch, files, hooks, worktree.Spec.Config.RandomizePorts, worktree.Worktree.Reused, context)
 		if setup.Run(ctx, plan, logger, options.ShellRunner) != 0 {
 			status = 1
 		}
@@ -403,6 +444,20 @@ func finishWorkspaceCommand(ctx context.Context, selection workspaceSelection, b
 		return status, nil
 	}
 	return openStatus, nil
+}
+
+func ensurePullRequestTargetManaged(target git.PullRequestTarget) error {
+	if !target.BranchExists {
+		return nil
+	}
+	context, ok, err := setup.ReadPullRequestContext(target.Worktree.WorktreePath)
+	if err != nil {
+		return err
+	}
+	if !ok || context.Number != target.PullRequest.Number || context.URL != target.PullRequest.URL {
+		return fmt.Errorf("local branch already exists but is not managed for PR #%d: %s", target.PullRequest.Number, target.Worktree.Branch)
+	}
+	return nil
 }
 
 func resolveWorkspaceSelection(ctx context.Context, options Options, homeOption string, allWorkspaces bool) (workspaceSelection, error) {
@@ -472,6 +527,76 @@ func resolveWorkspaceSelection(ctx context.Context, options Options, homeOption 
 		WorktreeHome:   worktreeHome,
 		Workspaces:     selected,
 		AllWorkspaces:  selectedAllWorkspaces,
+	}, nil
+}
+
+func resolvePullRequestWorkspaceSelection(ctx context.Context, options Options, homeOption string) (workspaceSelection, error) {
+	configRepoRoot, err := git.RepoRoot(ctx, options.Cwd, options.Runner)
+	if err != nil {
+		return workspaceSelection{}, err
+	}
+	configRepoSlug, err := git.RepoSlug(ctx, configRepoRoot, options.Runner)
+	if err != nil {
+		return workspaceSelection{}, err
+	}
+	homeDir, err := homeDir(options)
+	if err != nil {
+		return workspaceSelection{}, err
+	}
+	projectConfig, err := config.LoadProject(configRepoRoot, homeDir)
+	if err != nil {
+		return workspaceSelection{}, err
+	}
+
+	configDir := filepath.Dir(config.ProjectPath(configRepoRoot))
+	matches := []workspaceSpec{}
+	if len(projectConfig.Workspaces) == 0 {
+		matches = append(matches, workspaceSpec{Name: configRepoSlug, RepoRoot: configRepoRoot, Config: config.Workspace{Name: configRepoSlug}})
+	} else {
+		seenRepos := map[string]string{}
+		for _, workspace := range projectConfig.Workspaces {
+			repoPath := configRepoRoot
+			if workspace.Repo != "" {
+				repoPath, err = config.ExpandConfiguredPath(workspace.Repo, homeDir, configDir)
+				if err != nil {
+					return workspaceSelection{}, fmt.Errorf("%s repo: %w", workspace.Name, err)
+				}
+			}
+			repoRoot, err := git.RepoRoot(ctx, repoPath, options.Runner)
+			if err != nil {
+				return workspaceSelection{}, fmt.Errorf("%s repo: %w", workspace.Name, err)
+			}
+			if previous, ok := seenRepos[cleanAbsPath(repoRoot)]; ok {
+				return workspaceSelection{}, fmt.Errorf("workspaces %q and %q resolve to the same repo: %s", previous, workspace.Name, repoRoot)
+			}
+			seenRepos[cleanAbsPath(repoRoot)] = workspace.Name
+			if samePath(repoRoot, configRepoRoot) {
+				matches = append(matches, workspaceSpec{Name: workspace.Name, RepoRoot: repoRoot, Config: workspace})
+			}
+		}
+	}
+	if len(matches) == 0 {
+		matches = append(matches, workspaceSpec{Name: configRepoSlug, RepoRoot: configRepoRoot, Config: config.Workspace{Name: configRepoSlug}})
+	}
+
+	worktreeHome := homeOption
+	if worktreeHome == "" {
+		worktreeHome = projectConfig.WorktreeDir
+	}
+	if worktreeHome != "" {
+		worktreeHome, err = config.ExpandConfiguredPath(worktreeHome, homeDir, configDir)
+		if err != nil {
+			return workspaceSelection{}, fmt.Errorf("worktree_dir: %w", err)
+		}
+	}
+
+	return workspaceSelection{
+		Config:         projectConfig,
+		ConfigRepoRoot: configRepoRoot,
+		ConfigRepoSlug: configRepoSlug,
+		WorktreeHome:   worktreeHome,
+		Workspaces:     matches[:1],
+		AllWorkspaces:  false,
 	}, nil
 }
 
@@ -584,10 +709,11 @@ func sessionName(selection workspaceSelection, branch string) string {
 }
 
 type worktreeArgs struct {
-	Branch     string
-	From       string
-	Home       string
-	Workspaces bool
+	Branch      string
+	From        string
+	Home        string
+	PullRequest string
+	Workspaces  bool
 }
 
 func parseWorktreeArgs(command string, args []string) (worktreeArgs, error) {
@@ -598,6 +724,23 @@ func parseWorktreeArgs(command string, args []string) (worktreeArgs, error) {
 		switch {
 		case arg == "--workspaces":
 			parsed.Workspaces = true
+		case arg == "--pr":
+			if command != "switch" {
+				return worktreeArgs{}, fmt.Errorf("unknown option: %s", arg)
+			}
+			i++
+			if i >= len(args) || args[i] == "" || strings.HasPrefix(args[i], "-") {
+				return worktreeArgs{}, fmt.Errorf("%s", usageFor(command))
+			}
+			parsed.PullRequest = args[i]
+		case strings.HasPrefix(arg, "--pr="):
+			if command != "switch" {
+				return worktreeArgs{}, fmt.Errorf("unknown option: --pr")
+			}
+			parsed.PullRequest = strings.TrimPrefix(arg, "--pr=")
+			if parsed.PullRequest == "" || strings.HasPrefix(parsed.PullRequest, "-") {
+				return worktreeArgs{}, fmt.Errorf("%s", usageFor(command))
+			}
 		case arg == "--home":
 			i++
 			if i >= len(args) {
@@ -631,6 +774,15 @@ func parseWorktreeArgs(command string, args []string) (worktreeArgs, error) {
 			positionals = append(positionals, arg)
 		}
 	}
+	if parsed.PullRequest != "" {
+		if parsed.Workspaces {
+			return worktreeArgs{}, fmt.Errorf("--pr cannot be used with --workspaces")
+		}
+		if len(positionals) != 0 {
+			return worktreeArgs{}, fmt.Errorf("%s", usageFor(command))
+		}
+		return parsed, nil
+	}
 	if len(positionals) != 1 {
 		return worktreeArgs{}, fmt.Errorf("%s", usageFor(command))
 	}
@@ -641,6 +793,9 @@ func parseWorktreeArgs(command string, args []string) (worktreeArgs, error) {
 func usageFor(command string) string {
 	if command == "new" {
 		return "usage: wktree new [--home <path>] [--from <ref>] [--workspaces] <branch>"
+	}
+	if command == "switch" {
+		return "usage: wktree switch [--home <path>] [--workspaces] <branch> | wktree switch [--home <path>] --pr <number|url>"
 	}
 	return fmt.Sprintf("usage: wktree %s [--home <path>] [--workspaces] <branch>", command)
 }
@@ -779,6 +934,7 @@ Usage:
   wktree new [--home <path>] [--from <ref>] [--workspaces] <branch>
   wktree remove [--force] [--dry-run] [--workspaces] <branch>
   wktree switch [--home <path>] [--workspaces] <branch>
+  wktree switch [--home <path>] --pr <number|url>
   wktree completion zsh
   wktree completion bash
 
@@ -789,6 +945,7 @@ Examples:
   wktree new feature/example
   wktree new --from main feature/example
   wktree new --workspaces feature/example
+  wktree switch --pr 123
   wktree remove --dry-run --workspaces feature/example
   wktree switch --workspaces feature/example
   eval "$(wktree completion zsh)"

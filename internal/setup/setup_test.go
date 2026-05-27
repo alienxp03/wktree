@@ -160,6 +160,46 @@ func TestWriteContextEnv(t *testing.T) {
 	}
 }
 
+func TestContextEnvIncludesPullRequestMetadata(t *testing.T) {
+	root := t.TempDir()
+	worktreePath := filepath.Join(root, "worktree")
+	must(t, os.MkdirAll(worktreePath, 0o755))
+	plan := Plan{
+		WorktreePath: worktreePath,
+		Context: Context{
+			WorkspacePaths: map[string]string{"app": worktreePath},
+			PullRequest: &PullRequestContext{
+				Number:  123,
+				URL:     "https://github.com/alienxp03/demo/pull/123",
+				HeadRef: "contributor/feature",
+				HeadSHA: "abc123",
+			},
+		},
+	}
+
+	if err := WriteContextEnv(plan); err != nil {
+		t.Fatal(err)
+	}
+	got := read(t, ContextEnvPath(worktreePath))
+	for _, want := range []string{
+		"export WKTREE_PR_NUMBER='123'",
+		"export WKTREE_PR_URL='https://github.com/alienxp03/demo/pull/123'",
+		"export WKTREE_PR_HEAD_REF='contributor/feature'",
+		"export WKTREE_PR_HEAD_SHA='abc123'",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("context env missing %q:\n%s", want, got)
+		}
+	}
+	context, ok, err := ReadPullRequestContext(worktreePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || context.Number != 123 || context.URL != "https://github.com/alienxp03/demo/pull/123" || context.HeadRef != "contributor/feature" || context.HeadSHA != "abc123" {
+		t.Fatalf("ReadPullRequestContext = %+v, %v", context, ok)
+	}
+}
+
 func TestContextEnvWorkspaceDirCount(t *testing.T) {
 	root := t.TempDir()
 	worktreePath := filepath.Join(root, "worktree")

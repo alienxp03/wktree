@@ -1,0 +1,231 @@
+package git
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/alienxp03/wktree/internal/paths"
+	"github.com/alienxp03/wktree/internal/run"
+)
+
+type PullRequestOptions struct {
+	Value      string
+	HomeOption string
+	Cwd        string
+	Runner     run.Runner
+}
+
+type PullRequest struct {
+	Number      int
+	HeadRefName string
+	HeadRefOID  string
+	URL         string
+	RepoSlug    string
+}
+
+type PullRequestTarget struct {
+	Worktree     Worktree
+	PullRequest  PullRequest
+	FetchRef     string
+	BranchExists bool
+}
+
+type pullRequestView struct {
+	Number      int    `json:"number"`
+	HeadRefName string `json:"headRefName"`
+	HeadRefOID  string `json:"headRefOid"`
+	URL         string `json:"url"`
+}
+
+func ResolvePullRequestWorktree(ctx context.Context, options PullRequestOptions) (PullRequestTarget, error) {
+	runner := options.Runner
+	if runner == nil {
+		runner = run.DefaultRunner{}
+	}
+	if strings.TrimSpace(options.Value) == "" {
+		return PullRequestTarget{}, fmt.Errorf("pull request is required")
+	}
+
+	repoRoot, err := RepoRoot(ctx, options.Cwd, runner)
+	if err != nil {
+		return PullRequestTarget{}, err
+	}
+	pr, err := PullRequestInfo(ctx, repoRoot, options.Value, runner)
+	if err != nil {
+		return PullRequestTarget{}, err
+	}
+	if err := ensureBranchName(ctx, repoRoot, pr.HeadRefName, runner); err != nil {
+		return PullRequestTarget{}, err
+	}
+
+	worktree, err := buildWorktree(ctx, repoRoot, pr.HeadRefName, options.HomeOption, runner)
+	if err != nil {
+		return PullRequestTarget{}, err
+	}
+	target := PullRequestTarget{
+		Worktree:    worktree,
+		PullRequest: pr,
+		FetchRef:    fmt.Sprintf("refs/wktree/pr/%d/head", pr.Number),
+	}
+
+	exists, err := refExists(ctx, repoRoot, "refs/heads/"+pr.HeadRefName, runner)
+	if err != nil {
+		return PullRequestTarget{}, err
+	}
+	if !exists {
+		if err := ensureTargetPathAvailable(worktree.WorktreePath); err != nil {
+			return PullRequestTarget{}, err
+		}
+		return target, nil
+	}
+
+	worktreePath, ok, err := checkedOutWorktree(ctx, repoRoot, pr.HeadRefName, runner)
+	if err != nil {
+		return PullRequestTarget{}, err
+	}
+	if !ok {
+		return PullRequestTarget{}, fmt.Errorf("local branch already exists but is not checked out by a wktree PR worktree: %s", pr.HeadRefName)
+	}
+	worktree.Reused = true
+	worktree.WorktreePath = worktreePath
+	target.Worktree = worktree
+	target.BranchExists = true
+	return target, nil
+}
+
+func PullRequestInfo(ctx context.Context, repoRoot string, value string, runner run.Runner) (PullRequest, error) {
+	if runner == nil {
+		runner = run.DefaultRunner{}
+	}
+	prValue, err := normalizePullRequestValue(value)
+	if err != nil {
+		return PullRequest{}, err
+	}
+
+	args := []string{"pr", "view", prValue, "--json", "number,headRefName,headRefOid,url"}
+	result := runner.Run(ctx, "gh", args, run.Options{Cwd: repoRoot})
+	if result.Err != nil || result.ExitCode != 0 {
+		return PullRequest{}, fmt.Errorf("gh is required for --pr: %s", run.FailureMessage("gh", args, result))
+	}
+
+	var view pullRequestView
+	if err := json.Unmarshal([]byte(result.Stdout), &view); err != nil {
+		return PullRequest{}, fmt.Errorf("failed to parse gh pr view output: %w", err)
+	}
+	if view.Number <= 0 {
+		return PullRequest{}, fmt.Errorf("gh pr view did not return a pull request number")
+	}
+	if strings.TrimSpace(view.HeadRefName) == "" {
+		return PullRequest{}, fmt.Errorf("gh pr view did not return a PR head branch")
+	}
+	if strings.TrimSpace(view.HeadRefOID) == "" {
+		return PullRequest{}, fmt.Errorf("gh pr view did not return a PR head SHA")
+	}
+	repoSlug, numberFromURL, ok, err := paths.ParseGitHubPullURL(view.URL)
+	if err != nil {
+		return PullRequest{}, err
+	}
+	if !ok {
+		return PullRequest{}, fmt.Errorf("gh pr view returned an unsupported PR URL: %s", view.URL)
+	}
+	if numberFromURL != view.Number {
+		return PullRequest{}, fmt.Errorf("gh pr view returned mismatched PR number %d for URL %s", view.Number, view.URL)
+	}
+
+	originSlug, err := githubOriginSlug(ctx, repoRoot, runner)
+	if err != nil {
+		return PullRequest{}, err
+	}
+	if !sameRepoSlug(originSlug, repoSlug) {
+		return PullRequest{}, fmt.Errorf("PR repo %s does not match current repo %s", repoSlug, originSlug)
+	}
+
+	return PullRequest{
+		Number:      view.Number,
+		HeadRefName: view.HeadRefName,
+		HeadRefOID:  view.HeadRefOID,
+		URL:         view.URL,
+		RepoSlug:    repoSlug,
+	}, nil
+}
+
+func OpenPullRequestWorktree(ctx context.Context, target PullRequestTarget, runner run.Runner) (Worktree, error) {
+	if runner == nil {
+		runner = run.DefaultRunner{}
+	}
+	if err := fetchPullRequestRef(ctx, target, runner); err != nil {
+		return Worktree{}, err
+	}
+	if target.Worktree.Reused {
+		if err := resetWorktree(ctx, target.Worktree.WorktreePath, target.FetchRef, runner); err != nil {
+			return Worktree{}, err
+		}
+		return target.Worktree, nil
+	}
+	if err := ensureTargetPathAvailable(target.Worktree.WorktreePath); err != nil {
+		return Worktree{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(target.Worktree.WorktreePath), 0o755); err != nil {
+		return Worktree{}, err
+	}
+
+	args := []string{"worktree", "add", "-b", target.Worktree.Branch, target.Worktree.WorktreePath, target.FetchRef}
+	result := runGit(ctx, runner, target.Worktree.RepoRoot, args, false)
+	if result.Err != nil || result.ExitCode != 0 {
+		return Worktree{}, errors.New(run.FailureMessage("git", args, result))
+	}
+	return target.Worktree, nil
+}
+
+func fetchPullRequestRef(ctx context.Context, target PullRequestTarget, runner run.Runner) error {
+	source := fmt.Sprintf("+refs/pull/%d/head:%s", target.PullRequest.Number, target.FetchRef)
+	args := []string{"fetch", "origin", source}
+	result := runGit(ctx, runner, target.Worktree.RepoRoot, args, false)
+	if result.Err != nil || result.ExitCode != 0 {
+		return errors.New(run.FailureMessage("git", args, result))
+	}
+	return nil
+}
+
+func resetWorktree(ctx context.Context, worktreePath string, ref string, runner run.Runner) error {
+	args := []string{"reset", "--hard", ref}
+	result := runGit(ctx, runner, worktreePath, args, false)
+	if result.Err != nil || result.ExitCode != 0 {
+		return errors.New(run.FailureMessage("git", args, result))
+	}
+	return nil
+}
+
+func githubOriginSlug(ctx context.Context, repoRoot string, runner run.Runner) (string, error) {
+	remote := OriginRemoteURL(ctx, repoRoot, runner)
+	slug, ok, err := paths.ParseGitHubRemote(remote)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("repo has no supported GitHub origin remote required for --pr")
+	}
+	return slug, nil
+}
+
+func sameRepoSlug(left string, right string) bool {
+	return strings.EqualFold(filepath.ToSlash(left), filepath.ToSlash(right))
+}
+
+func normalizePullRequestValue(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if strings.HasPrefix(trimmed, "https://") || strings.HasPrefix(trimmed, "http://") {
+		return trimmed, nil
+	}
+	number, err := strconv.Atoi(trimmed)
+	if err != nil || number <= 0 {
+		return "", fmt.Errorf("pull request must be a number or GitHub PR URL: %s", value)
+	}
+	return trimmed, nil
+}

@@ -1,6 +1,7 @@
 package wktree_test
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -183,6 +184,100 @@ func TestWktreeSwitchRequiresExistingBranch(t *testing.T) {
 	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "feature/missing"}, repo.sourceRoot, env)
 	if result.exitCode == 0 || !strings.Contains(result.stderr, "branch does not exist locally or on origin: feature/missing") {
 		t.Fatalf("expected missing branch error, status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+}
+
+func TestWktreeSwitchPullRequestCreatesAndUpdatesSingleRepoWorktree(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	createSiblingRepo(t, repo.root, "frontend", "frontend")
+	env := testEnv(t, repo.root)
+	enableLocalOrigin(t, repo)
+	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
+		"worktree_dir: " + repo.worktreeHome,
+		"workspace_mode: all",
+		"workspaces:",
+		"  - name: backend",
+		"    hooks:",
+		"      post_create:",
+		"        - printf prsetup > prsetup.txt",
+		"  - name: frontend",
+		"    repo: ../frontend",
+		"    hooks:",
+		"      post_create:",
+		"        - printf frontend > frontend.txt",
+		"",
+	}, "\n"))
+	firstHead := pushPullRefCommit(t, repo, 123, "pr.txt", "first\n")
+	writeFakeGh(t, env, pullRequestJSON(123, "contributor/feature", firstHead, "https://github.com/alienxp03/demo/pull/123"))
+	result := runWktree(t, binary, []string{"switch", "--pr", "123"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("switch --pr status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "contributor-feature")
+	if got := git(t, []string{"branch", "--show-current"}, worktreePath); got != "contributor/feature" {
+		t.Fatalf("branch = %q", got)
+	}
+	if got := git(t, []string{"rev-parse", "HEAD"}, worktreePath); got != firstHead {
+		t.Fatalf("HEAD = %q, want %q", got, firstHead)
+	}
+	if got := read(t, filepath.Join(worktreePath, "prsetup.txt")); got != "prsetup" {
+		t.Fatalf("prsetup.txt = %q", got)
+	}
+	envFile := read(t, filepath.Join(worktreePath, ".wktree.env"))
+	for _, want := range []string{"WKTREE_BACKEND_DIR=", "WKTREE_PR_NUMBER='123'", "WKTREE_PR_URL='https://github.com/alienxp03/demo/pull/123'", "WKTREE_PR_HEAD_REF='contributor/feature'"} {
+		if !strings.Contains(envFile, want) {
+			t.Fatalf("PR env missing %q:\n%s", want, envFile)
+		}
+	}
+	if strings.Contains(envFile, "WKTREE_FRONTEND_DIR=") {
+		t.Fatalf("PR mode should not include frontend workspace:\n%s", envFile)
+	}
+	frontendPath := filepath.Join(repo.worktreeHome, "alienxp03", "frontend", "contributor-feature")
+	if _, err := os.Stat(frontendPath); !os.IsNotExist(err) {
+		t.Fatalf("PR mode should not create frontend worktree, stat err=%v", err)
+	}
+
+	secondHead := pushPullRefCommit(t, repo, 123, "pr.txt", "second\n")
+	writeFakeGh(t, env, pullRequestJSON(123, "contributor/feature", secondHead, "https://github.com/alienxp03/demo/pull/123"))
+	result = runWktree(t, binary, []string{"switch", "--pr=https://github.com/alienxp03/demo/pull/123"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("reuse switch --pr status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	if got := git(t, []string{"rev-parse", "HEAD"}, worktreePath); got != secondHead {
+		t.Fatalf("reused HEAD = %q, want %q", got, secondHead)
+	}
+	if got := read(t, filepath.Join(worktreePath, "pr.txt")); got != "second\n" {
+		t.Fatalf("pr.txt = %q", got)
+	}
+}
+
+func TestWktreeSwitchPullRequestRejectsRepoMismatch(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	env := testEnv(t, repo.root)
+	enableLocalOrigin(t, repo)
+	head := pushPullRefCommit(t, repo, 123, "pr.txt", "mismatch\n")
+	writeFakeGh(t, env, pullRequestJSON(123, "contributor/feature", head, "https://github.com/other/demo/pull/123"))
+
+	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "--pr", "123"}, repo.sourceRoot, env)
+	if result.exitCode == 0 || !strings.Contains(result.stderr, "does not match current repo") {
+		t.Fatalf("expected repo mismatch, status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+}
+
+func TestWktreeSwitchPullRequestRejectsBranchCollision(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	env := testEnv(t, repo.root)
+	enableLocalOrigin(t, repo)
+	head := pushPullRefCommit(t, repo, 123, "pr.txt", "collision\n")
+	writeFakeGh(t, env, pullRequestJSON(123, "feature/collision", head, "https://github.com/alienxp03/demo/pull/123"))
+	git(t, []string{"branch", "feature/collision"}, repo.sourceRoot)
+
+	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "--pr", "123"}, repo.sourceRoot, env)
+	if result.exitCode == 0 || !strings.Contains(result.stderr, "local branch already exists") {
+		t.Fatalf("expected branch collision, status=%d stderr=%s", result.exitCode, result.stderr)
 	}
 }
 
@@ -674,6 +769,46 @@ func createSiblingRepo(t *testing.T, root string, dirName string, remoteRepo str
 	git(t, []string{"commit", "-m", "Initial commit"}, sourceRoot)
 	git(t, []string{"remote", "add", "origin", "git@github.com:alienxp03/" + remoteRepo + ".git"}, sourceRoot)
 	return sourceRoot
+}
+
+func enableLocalOrigin(t *testing.T, repo tempRepo) string {
+	t.Helper()
+	originRoot := filepath.Join(repo.root, "origin.git")
+	git(t, []string{"init", "--bare", originRoot}, repo.root)
+	git(t, []string{"config", "url." + originRoot + ".insteadOf", "git@github.com:alienxp03/demo.git"}, repo.sourceRoot)
+	return originRoot
+}
+
+func pushPullRefCommit(t *testing.T, repo tempRepo, number int, relativePath string, content string) string {
+	t.Helper()
+	write(t, filepath.Join(repo.sourceRoot, relativePath), content)
+	git(t, []string{"add", relativePath}, repo.sourceRoot)
+	git(t, []string{"commit", "-m", fmt.Sprintf("PR %d update", number)}, repo.sourceRoot)
+	head := git(t, []string{"rev-parse", "HEAD"}, repo.sourceRoot)
+	git(t, []string{"push", "origin", "HEAD:refs/pull/" + strconv.Itoa(number) + "/head"}, repo.sourceRoot)
+	return head
+}
+
+func writeFakeGh(t *testing.T, env []string, response string) {
+	t.Helper()
+	pathValue := envValue(env, "PATH")
+	binDir := strings.Split(pathValue, string(os.PathListSeparator))[0]
+	must(t, os.WriteFile(filepath.Join(binDir, "gh"), []byte(strings.Join([]string{
+		"#!/bin/sh",
+		"if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then",
+		"  cat <<'JSON'",
+		response,
+		"JSON",
+		"  exit 0",
+		"fi",
+		"echo unexpected gh args: \"$@\" >&2",
+		"exit 1",
+		"",
+	}, "\n")), 0o755))
+}
+
+func pullRequestJSON(number int, headRefName string, headRefOID string, url string) string {
+	return fmt.Sprintf(`{"number":%d,"headRefName":%q,"headRefOid":%q,"url":%q}`, number, headRefName, headRefOID, url)
 }
 
 type commandResult struct {

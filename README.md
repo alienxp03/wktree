@@ -37,6 +37,7 @@ wktree new feature/example
 wktree new --from main feature/example
 wktree new --workspaces feature/example
 wktree switch feature/example
+wktree switch --pr 123
 wktree switch --workspaces feature/example
 wktree remove feature/example
 wktree remove --dry-run --workspaces feature/example
@@ -48,6 +49,8 @@ wktree remove --force --workspaces feature/example
 `wktree new --workspaces <branch>` creates the same branch across every configured workspace repo and opens them together in tmux.
 
 `wktree switch <branch>` opens an existing branch worktree. If the branch exists but has no worktree yet, it creates one. If only `origin/<branch>` exists, it creates a local tracking branch and worktree.
+
+`wktree switch --pr <number-or-url>` opens a GitHub pull request for the current repo only. It requires the GitHub CLI, fetches the PR head from `origin`, uses the PR contributor branch name for the local branch and worktree, and ignores workspace fan-out even when `workspace_mode: all` is configured.
 
 `wktree remove <branch>` kills the matching tmux window or session target, removes the branch worktree, and deletes the local branch with Git's safe deletion rules. It does not remove remote branches. Use `--dry-run` to preview the tmux and Git actions. Use `--force` to remove a dirty worktree and force-delete the local branch. If `.wktree.env` shows that the branch was opened with multiple workspaces, single-workspace remove stops and asks for `--workspaces`.
 
@@ -207,6 +210,8 @@ export WKTREE_FRONTEND_DIR='/Users/stan/worktree/org/frontend/feature-example'
 
 Variable names are derived from workspace names as `WKTREE_<WORKSPACE_NAME>_DIR`, uppercased with non-alphanumeric runs replaced by `_`. Names that would collide after sanitizing, such as `front-end` and `front end`, are rejected when the config loads.
 
+PR worktrees also include `WKTREE_PR_NUMBER`, `WKTREE_PR_URL`, `WKTREE_PR_HEAD_REF`, and `WKTREE_PR_HEAD_SHA`. `wktree switch --pr` uses these markers to safely update a previously opened PR worktree and to avoid overwriting unrelated local branches with the same contributor branch name.
+
 Pane commands and `post_create` hooks source this env file before running. `wktree` does not edit `.gitignore`; `remove` deletes its generated env file before removing the worktree.
 
 ## Tmux
@@ -246,6 +251,8 @@ Completion includes commands, flags, existing local and `origin` branches for `s
 - `local branch already exists`: choose a branch name that does not exist locally.
 - `origin branch already exists`: fetches or remote refs already include that branch.
 - `branch does not exist locally or on origin`: use `wktree new <branch>` to create a new branch.
+- `gh is required for --pr`: install and authenticate the GitHub CLI, then rerun `wktree switch --pr <number-or-url>`.
+- `local branch already exists but is not managed for PR`: rename or delete the unrelated local branch, or open the PR with a different branch name upstream.
 - `branch is not merged into current HEAD`: merge the branch or use `wktree remove --force <branch>` if you really want to delete it.
 - `target worktree path already exists`: remove or rename the existing directory, or use `--home`.
 - `tmux ... failed`: install tmux or choose names that produce non-conflicting tmux targets.

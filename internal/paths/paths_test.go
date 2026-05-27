@@ -47,6 +47,28 @@ func TestParseGitHubRemote(t *testing.T) {
 	}
 }
 
+func TestParseGitHubPullURL(t *testing.T) {
+	gotSlug, gotNumber, ok, err := ParseGitHubPullURL("https://github.com/alienxp03/dotfiles/pull/123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || gotSlug != filepath.Join("alienxp03", "dotfiles") || gotNumber != 123 {
+		t.Fatalf("ParseGitHubPullURL returned slug=%q number=%d ok=%v", gotSlug, gotNumber, ok)
+	}
+
+	gotSlug, gotNumber, ok, err = ParseGitHubPullURL("https://github.com/alienxp03/dotfiles/pull/123/files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || gotSlug != filepath.Join("alienxp03", "dotfiles") || gotNumber != 123 {
+		t.Fatalf("ParseGitHubPullURL with suffix returned slug=%q number=%d ok=%v", gotSlug, gotNumber, ok)
+	}
+
+	if _, _, ok, err := ParseGitHubPullURL("https://example.com/alienxp03/dotfiles/pull/123"); ok || err != nil {
+		t.Fatalf("non-GitHub PR URL should not parse, ok=%v err=%v", ok, err)
+	}
+}
+
 func TestRepoDirectorySlug(t *testing.T) {
 	got, err := RepoDirectorySlug("/tmp/example repo", "Test User")
 	if err != nil {
