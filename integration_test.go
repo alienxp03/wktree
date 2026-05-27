@@ -400,11 +400,78 @@ func TestWktreeRemoveDeletesWorktreeAndBranch(t *testing.T) {
 	if result.exitCode != 0 {
 		t.Fatalf("remove status=%d stderr=%s", result.exitCode, result.stderr)
 	}
+	for _, want := range []string{
+		"remove: alienxp03/demo: checking clean worktree",
+		"remove: alienxp03/demo: cleaning generated workspace env",
+		"remove: closing tmux targets",
+		"remove: alienxp03/demo: removing git worktree",
+		"remove: alienxp03/demo: deleting local branch",
+		"removed feature/remove",
+	} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("remove output missing %q:\n%s", want, result.stdout)
+		}
+	}
 	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
 		t.Fatalf("expected worktree removed, stat err=%v", err)
 	}
 	if got := git(t, []string{"branch", "--list", "feature/remove"}, repo.sourceRoot); got != "" {
 		t.Fatalf("branch still exists: %q", got)
+	}
+}
+
+func TestWktreeCloseKeepsWorktreeAndBranch(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	env := testEnv(t, repo.root)
+
+	result := runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "feature/close"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("new status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-close")
+
+	result = runWktree(t, binary, []string{"__complete", "close", "feature/c"}, repo.sourceRoot, env)
+	if result.exitCode != 0 || !strings.Contains(result.stdout, "feature/close") {
+		t.Fatalf("close completion status=%d stdout=%q stderr=%s", result.exitCode, result.stdout, result.stderr)
+	}
+	result = runWktree(t, binary, []string{"__complete", "close", "feature/c"}, worktreePath, env)
+	if result.exitCode != 0 || !strings.Contains(result.stdout, "feature/close") {
+		t.Fatalf("close current worktree completion status=%d stdout=%q stderr=%s", result.exitCode, result.stdout, result.stderr)
+	}
+
+	result = runWktree(t, binary, []string{"close", "--dry-run", "feature/close"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("dry-run close status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	for _, want := range []string{"dry run: close", "tmux mode:", "tmux kill-window"} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("dry-run close output missing %q:\n%s", want, result.stdout)
+		}
+	}
+	for _, notWant := range []string{"git worktree remove", "git branch -d"} {
+		if strings.Contains(result.stdout, notWant) {
+			t.Fatalf("dry-run close output should not include %q:\n%s", notWant, result.stdout)
+		}
+	}
+
+	result = runWktree(t, binary, []string{"close", "feature/close"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("close status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	for _, want := range []string{"close: closing tmux targets", "closed feature/close"} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("close output missing %q:\n%s", want, result.stdout)
+		}
+	}
+	if _, err := os.Stat(worktreePath); err != nil {
+		t.Fatalf("expected close to keep worktree, stat err=%v", err)
+	}
+	if got := git(t, []string{"branch", "--list", "feature/close"}, repo.sourceRoot); !strings.Contains(got, "feature/close") {
+		t.Fatalf("expected close to keep branch, branch list=%q", got)
+	}
+	if _, err := os.Stat(filepath.Join(worktreePath, ".wktree.env")); err != nil {
+		t.Fatalf("expected close to keep .wktree.env, stat err=%v", err)
 	}
 }
 
@@ -540,6 +607,17 @@ func TestWktreeNewAndRemoveWorkspaces(t *testing.T) {
 	if result.exitCode != 0 {
 		t.Fatalf("remove workspaces status=%d stderr=%s", result.exitCode, result.stderr)
 	}
+	for _, want := range []string{
+		"remove: backend: cleaning generated workspace env",
+		"remove: frontend: cleaning generated workspace env",
+		"remove: closing tmux targets",
+		"remove: backend: removing git worktree",
+		"remove: frontend: deleting local branch",
+	} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("remove workspaces output missing %q:\n%s", want, result.stdout)
+		}
+	}
 	if _, err := os.Stat(backendPath); !os.IsNotExist(err) {
 		t.Fatalf("expected backend removed, stat err=%v", err)
 	}
@@ -585,6 +663,25 @@ func TestWktreeRemoveRequiresWorkspacesForMultiWorkspaceEnv(t *testing.T) {
 	}
 	if _, err := os.Stat(frontendPath); err != nil {
 		t.Fatalf("expected frontend to remain, stat err=%v", err)
+	}
+
+	result = runWktree(t, binary, []string{"close", "feature/guard"}, repo.sourceRoot, env)
+	if result.exitCode == 0 || !strings.Contains(result.stderr, "multiple workspaces") || !strings.Contains(result.stderr, "--workspaces") {
+		t.Fatalf("close status=%d stdout=%s stderr=%s", result.exitCode, result.stdout, result.stderr)
+	}
+
+	result = runWktree(t, binary, []string{"close", "--workspaces", "feature/guard"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("close workspaces status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	if !strings.Contains(result.stdout, "close: closing tmux targets") || !strings.Contains(result.stdout, "closed feature/guard") {
+		t.Fatalf("close workspaces output = %s", result.stdout)
+	}
+	if _, err := os.Stat(backendPath); err != nil {
+		t.Fatalf("expected close to keep backend, stat err=%v", err)
+	}
+	if _, err := os.Stat(frontendPath); err != nil {
+		t.Fatalf("expected close to keep frontend, stat err=%v", err)
 	}
 
 	result = runWktree(t, binary, []string{"remove", "--force", "--workspaces", "feature/guard"}, repo.sourceRoot, env)
@@ -704,6 +801,65 @@ func TestWktreeProjectLocalConfigUsesOpenedFolder(t *testing.T) {
 	}
 	if got := read(t, filepath.Join(projectWorktree, "cwd.txt")); got != projectWorktree+"\n" {
 		t.Fatalf("hook cwd = %q, want %q", got, projectWorktree+"\n")
+	}
+}
+
+func TestWktreeSetEnvUsesRandomizedWorkspaceValues(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	repoBRoot := createSiblingRepo(t, repo.root, "repo_b", "repo-b")
+	write(t, filepath.Join(repo.sourceRoot, ".env"), "PORT=3000\n")
+	write(t, filepath.Join(repoBRoot, ".env"), "URL=http://localhost:5001/url\n")
+	env := testEnv(t, repo.root)
+	openLog := filepath.Join(repo.root, "open.log")
+	env = append(env, "WKTREE_TEST_OPEN_LOG="+openLog)
+	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
+		"worktree_dir: " + repo.worktreeHome,
+		"workspace_mode: all",
+		"workspaces:",
+		"  - name: repo_a",
+		"    files:",
+		"      copy:",
+		"        - .env",
+		"    randomize_ports:",
+		"      - file: .env",
+		"        vars:",
+		"          - PORT",
+		"  - name: repo_b",
+		"    repo: ../repo_b",
+		"    files:",
+		"      copy:",
+		"        - .env",
+		"    set_env:",
+		"      - file: .env",
+		"        vars:",
+		"          URL: http://localhost:${repo_a:PORT}/url",
+		"    open:",
+		"      - http://localhost:${repo_a:PORT}/url",
+		"",
+	}, "\n"))
+
+	result := runWktree(t, binary, []string{"new", "feature/set-env"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("set_env status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	repoAWorktree := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-set-env")
+	repoBWorktree := filepath.Join(repo.worktreeHome, "alienxp03", "repo-b", "feature-set-env")
+	port := envFileValue(t, read(t, filepath.Join(repoAWorktree, ".env")), "PORT")
+	if !isPort(port) || port == "3000" {
+		t.Fatalf("PORT should be randomized, got %q", port)
+	}
+	if got := envFileValue(t, read(t, filepath.Join(repoBWorktree, ".env")), "URL"); got != "http://localhost:"+port+"/url" {
+		t.Fatalf("URL = %q, want port %s", got, port)
+	}
+	if !strings.Contains(result.stdout, "repo_b: set env in .env") {
+		t.Fatalf("setup log missing set_env:\n%s", result.stdout)
+	}
+	if !strings.Contains(result.stdout, "repo_b: opened http://localhost:"+port+"/url") {
+		t.Fatalf("setup log missing open:\n%s", result.stdout)
+	}
+	if got := strings.TrimSpace(read(t, openLog)); got != "http://localhost:"+port+"/url" {
+		t.Fatalf("open log = %q, want port %s", got, port)
 	}
 }
 
@@ -985,6 +1141,17 @@ func testEnv(t *testing.T, root string) []string {
 		"esac",
 		"",
 	}, "\n")), 0o755))
+	openScript := strings.Join([]string{
+		"#!/bin/sh",
+		"if [ -n \"${WKTREE_TEST_OPEN_LOG:-}\" ]; then",
+		"  printf '%s\\n' \"$1\" >> \"$WKTREE_TEST_OPEN_LOG\"",
+		"fi",
+		"exit 0",
+		"",
+	}, "\n")
+	for _, name := range []string{"open", "xdg-open"} {
+		must(t, os.WriteFile(filepath.Join(binDir, name), []byte(openScript), 0o755))
+	}
 	return append(os.Environ(),
 		"HOME="+filepath.Join(root, "home"),
 		"XDG_CONFIG_HOME="+filepath.Join(root, "xdg"),

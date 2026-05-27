@@ -90,6 +90,17 @@ func TestInvalidRemoveUsage(t *testing.T) {
 	}
 }
 
+func TestInvalidCloseUsage(t *testing.T) {
+	stderr := &bytes.Buffer{}
+	status := Run([]string{"close"}, Options{Stdout: &bytes.Buffer{}, Stderr: stderr})
+	if status != 1 {
+		t.Fatalf("status = %d", status)
+	}
+	if !strings.Contains(stderr.String(), "usage: wktree close") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
 func TestInvalidSwitchUsage(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	status := Run([]string{"switch"}, Options{Stdout: &bytes.Buffer{}, Stderr: stderr})

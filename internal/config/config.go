@@ -41,6 +41,8 @@ type Workspace struct {
 	Repo           string          `yaml:"repo"`
 	Panes          []PaneCommand   `yaml:"panes"`
 	RandomizePorts []RandomizePort `yaml:"randomize_ports"`
+	SetEnv         []SetEnv        `yaml:"set_env"`
+	Open           []string        `yaml:"open"`
 	// Commands is a legacy alias for Panes.
 	Commands []PaneCommand `yaml:"commands"`
 	Files    Files         `yaml:"files"`
@@ -50,6 +52,11 @@ type Workspace struct {
 type RandomizePort struct {
 	File string   `yaml:"file"`
 	Vars []string `yaml:"vars"`
+}
+
+type SetEnv struct {
+	File string            `yaml:"file"`
+	Vars map[string]string `yaml:"vars"`
 }
 
 type PaneCommand struct {
@@ -99,6 +106,12 @@ workspaces:
     #     vars:
     #       - PORT
     #       - APP_PORT
+    # set_env:
+    #   - file: .env.local
+    #     vars:
+    #       API_URL: "http://localhost:${window_name:.env.local:PORT}/api"
+    # open:
+    #   - "http://localhost:${window_name:.env.local:PORT}"
     # panes:
     #   - command: nvim
     #     focus: true
@@ -236,7 +249,7 @@ func (config Config) HasSetup() bool {
 		return true
 	}
 	for _, workspace := range config.Workspaces {
-		if hasFiles(workspace.Files) || hasHooks(workspace.Hooks) || len(workspace.RandomizePorts) > 0 {
+		if hasFiles(workspace.Files) || hasHooks(workspace.Hooks) || len(workspace.RandomizePorts) > 0 || len(workspace.SetEnv) > 0 {
 			return true
 		}
 	}
@@ -326,6 +339,12 @@ func validateConfig(config *Config, filePath string, homeDir string) error {
 		if err := validateRandomizePorts(workspace.RandomizePorts, prefix+".randomize_ports", filePath); err != nil {
 			return err
 		}
+		if err := validateSetEnv(workspace.SetEnv, prefix+".set_env", filePath); err != nil {
+			return err
+		}
+		if err := validateStrings(workspace.Open, prefix+".open", filePath); err != nil {
+			return err
+		}
 		if len(workspace.Panes) > 0 && len(workspace.Commands) > 0 {
 			return fmt.Errorf("invalid config in %s: %s must use panes or commands, not both", filePath, prefix)
 		}
@@ -404,6 +423,30 @@ func validateRandomizePorts(randomizePorts []RandomizePort, key string, filePath
 				return fmt.Errorf("invalid config in %s: duplicate randomize port var %q in %s", filePath, name, label)
 			}
 			seen[name] = true
+		}
+	}
+	return nil
+}
+
+func validateSetEnv(setEnv []SetEnv, key string, filePath string) error {
+	for index, item := range setEnv {
+		label := fmt.Sprintf("%s[%d]", key, index)
+		if strings.TrimSpace(item.File) == "" {
+			return fmt.Errorf("invalid config in %s: %s.file must be a non-empty string", filePath, label)
+		}
+		if err := validateSetupPaths([]string{item.File}, label+".file", filePath); err != nil {
+			return err
+		}
+		if len(item.Vars) == 0 {
+			return fmt.Errorf("invalid config in %s: %s.vars must define at least one variable", filePath, label)
+		}
+		for name, value := range item.Vars {
+			if !isEnvVarName(name) {
+				return fmt.Errorf("invalid config in %s: %s.vars key %q must be a valid env var name", filePath, label, name)
+			}
+			if strings.TrimSpace(value) == "" {
+				return fmt.Errorf("invalid config in %s: %s.vars.%s must be a non-empty string", filePath, label, name)
+			}
 		}
 	}
 	return nil

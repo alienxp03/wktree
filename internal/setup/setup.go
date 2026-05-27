@@ -25,6 +25,7 @@ type Plan struct {
 	Copy                []string
 	Symlink             []string
 	RandomizePorts      []config.RandomizePort
+	SetEnv              []config.SetEnv
 	PreserveRandomPorts bool
 	PostCreate          []string
 	Context             Context
@@ -78,7 +79,7 @@ func (DefaultShellRunner) RunShell(ctx context.Context, command string, cwd stri
 	return shellResult(err, stdout.String(), stderr.String())
 }
 
-func NewPlan(repoRoot string, worktreePath string, workspaceName string, branch string, files config.Files, hooks config.Hooks, randomizePorts []config.RandomizePort, preserveRandomPorts bool, context Context) Plan {
+func NewPlan(repoRoot string, worktreePath string, workspaceName string, branch string, files config.Files, hooks config.Hooks, randomizePorts []config.RandomizePort, setEnv []config.SetEnv, preserveRandomPorts bool, context Context) Plan {
 	return Plan{
 		RepoRoot:            repoRoot,
 		WorktreePath:        worktreePath,
@@ -87,6 +88,7 @@ func NewPlan(repoRoot string, worktreePath string, workspaceName string, branch 
 		Copy:                append([]string(nil), files.Copy...),
 		Symlink:             append([]string(nil), files.Symlink...),
 		RandomizePorts:      append([]config.RandomizePort(nil), randomizePorts...),
+		SetEnv:              cloneSetEnv(setEnv),
 		PreserveRandomPorts: preserveRandomPorts,
 		PostCreate:          append([]string(nil), hooks.PostCreate...),
 		Context:             context,
@@ -94,20 +96,48 @@ func NewPlan(repoRoot string, worktreePath string, workspaceName string, branch 
 }
 
 func Run(ctx context.Context, plan Plan, logger Logger, shellRunner ShellRunner) int {
+	prepareStatus := RunPrepare(plan, logger)
+	setEnvStatus := SetEnvFiles(plan, logger)
+	contextStatus := WriteContextEnvLogged(plan, logger)
+	commandStatus := RunPostCreate(ctx, plan, logger, shellRunner)
+	if prepareStatus == 0 && setEnvStatus == 0 && contextStatus == 0 && commandStatus == 0 {
+		return 0
+	}
+	return 1
+}
+
+func RunPrepare(plan Plan, logger Logger) int {
 	existingRandomizeFiles := existingRandomizeDestinations(plan)
 	copyStatus := CopyFiles(plan, logger)
 	symlinkStatus := SymlinkFiles(plan, logger)
 	randomizeStatus := randomizeEnvPorts(plan, logger, AllocateLocalPort, existingRandomizeFiles)
-	contextStatus := 0
-	if err := WriteContextEnv(plan); err != nil {
-		logger.Warn("failed to write workspace env: %s", err)
-		contextStatus = 1
-	}
-	commandStatus := RunPostCreate(ctx, plan, logger, shellRunner)
-	if copyStatus == 0 && symlinkStatus == 0 && randomizeStatus == 0 && contextStatus == 0 && commandStatus == 0 {
+	if copyStatus == 0 && symlinkStatus == 0 && randomizeStatus == 0 {
 		return 0
 	}
 	return 1
+}
+
+func WriteContextEnvLogged(plan Plan, logger Logger) int {
+	if err := WriteContextEnv(plan); err != nil {
+		logger.Warn("failed to write workspace env: %s", err)
+		return 1
+	}
+	return 0
+}
+
+func cloneSetEnv(items []config.SetEnv) []config.SetEnv {
+	cloned := make([]config.SetEnv, 0, len(items))
+	for _, item := range items {
+		vars := map[string]string{}
+		for name, value := range item.Vars {
+			vars[name] = value
+		}
+		cloned = append(cloned, config.SetEnv{
+			File: item.File,
+			Vars: vars,
+		})
+	}
+	return cloned
 }
 
 func CopyFiles(plan Plan, logger Logger) int {
@@ -267,6 +297,225 @@ func existingRandomizeDestinations(plan Plan) map[string]bool {
 		existing[item.File] = isWithin(plan.WorktreePath, destinationPath) && pathExists(destinationPath)
 	}
 	return existing
+}
+
+func SetEnvFiles(plan Plan, logger Logger) int {
+	status := 0
+	for _, item := range plan.SetEnv {
+		destinationPath := filepath.Join(plan.WorktreePath, item.File)
+		if !isWithin(plan.WorktreePath, destinationPath) {
+			logger.Warn("skipping unsafe set_env path: %s", item.File)
+			status = 1
+			continue
+		}
+		source, err := os.ReadFile(destinationPath)
+		if os.IsNotExist(err) {
+			logger.Warn("set_env file not found, skipping: %s", item.File)
+			continue
+		}
+		if err != nil {
+			logger.Warn("failed to read set_env file %s: %s", item.File, err)
+			status = 1
+			continue
+		}
+
+		values := map[string]string{}
+		failed := false
+		for _, name := range sortedKeys(item.Vars) {
+			value, err := RenderSetEnvTemplate(item.Vars[name], plan.Context)
+			if err != nil {
+				logger.Warn("failed to resolve set_env %s in %s: %s", name, item.File, err)
+				status = 1
+				failed = true
+				continue
+			}
+			values[name] = value
+		}
+		if failed {
+			continue
+		}
+
+		updated, changed := renderSetEnvFile(string(source), values)
+		if !changed {
+			continue
+		}
+		stat, err := os.Stat(destinationPath)
+		if err != nil {
+			logger.Warn("failed to stat set_env file %s: %s", item.File, err)
+			status = 1
+			continue
+		}
+		if err := os.WriteFile(destinationPath, []byte(updated), stat.Mode().Perm()); err != nil {
+			logger.Warn("failed to write set_env values to %s: %s", item.File, err)
+			status = 1
+			continue
+		}
+		logger.Info("set env in %s", item.File)
+	}
+	return status
+}
+
+func RenderSetEnvTemplate(template string, context Context) (string, error) {
+	var output strings.Builder
+	remaining := template
+	for {
+		start := strings.Index(remaining, "${")
+		if start < 0 {
+			output.WriteString(remaining)
+			return output.String(), nil
+		}
+		output.WriteString(remaining[:start])
+		afterStart := remaining[start+2:]
+		end := strings.Index(afterStart, "}")
+		if end < 0 {
+			return "", fmt.Errorf("unterminated template reference")
+		}
+		reference := afterStart[:end]
+		if strings.Contains(reference, ":") {
+			value, err := resolveSetEnvReference(reference, context)
+			if err != nil {
+				return "", err
+			}
+			output.WriteString(value)
+		} else {
+			output.WriteString("${")
+			output.WriteString(reference)
+			output.WriteString("}")
+		}
+		remaining = afterStart[end+1:]
+	}
+}
+
+func resolveSetEnvReference(reference string, context Context) (string, error) {
+	parts := strings.Split(reference, ":")
+	workspaceName := ""
+	sourceFile := ".env"
+	varName := ""
+	switch len(parts) {
+	case 2:
+		workspaceName = parts[0]
+		varName = parts[1]
+	case 3:
+		workspaceName = parts[0]
+		sourceFile = parts[1]
+		varName = parts[2]
+	default:
+		return "", fmt.Errorf("invalid template reference %q", reference)
+	}
+	if workspaceName == "" || sourceFile == "" || varName == "" {
+		return "", fmt.Errorf("invalid template reference %q", reference)
+	}
+	workspacePath, ok := context.WorkspacePaths[workspaceName]
+	if !ok {
+		return "", fmt.Errorf("unknown workspace %q", workspaceName)
+	}
+	sourcePath := filepath.Join(workspacePath, sourceFile)
+	if !isWithin(workspacePath, sourcePath) {
+		return "", fmt.Errorf("unsafe source path in template reference %q", reference)
+	}
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		return "", fmt.Errorf("read %s:%s: %w", workspaceName, sourceFile, err)
+	}
+	value, ok := envFileValue(string(source), varName)
+	if !ok {
+		return "", fmt.Errorf("missing %s in %s:%s", varName, workspaceName, sourceFile)
+	}
+	return value, nil
+}
+
+func renderSetEnvFile(source string, values map[string]string) (string, bool) {
+	seen := map[string]bool{}
+	lines := strings.SplitAfter(source, "\n")
+	var output strings.Builder
+	changed := false
+	for _, line := range lines {
+		name, prefix, ok := envAssignment(line)
+		value, shouldSet := values[name]
+		if !ok || !shouldSet {
+			output.WriteString(line)
+			continue
+		}
+		seen[name] = true
+		newLine := prefix + quoteEnvValue(value, envValueQuote(line))
+		if strings.HasSuffix(line, "\n") {
+			newLine += "\n"
+		}
+		output.WriteString(newLine)
+		if newLine != line {
+			changed = true
+		}
+	}
+	for _, name := range sortedKeys(values) {
+		if seen[name] {
+			continue
+		}
+		if output.Len() > 0 && !strings.HasSuffix(output.String(), "\n") {
+			output.WriteByte('\n')
+		}
+		output.WriteString(name)
+		output.WriteByte('=')
+		output.WriteString(values[name])
+		output.WriteByte('\n')
+		changed = true
+	}
+	return output.String(), changed
+}
+
+func envFileValue(source string, varName string) (string, bool) {
+	for _, line := range strings.SplitAfter(source, "\n") {
+		name, _, ok := envAssignment(line)
+		if !ok || name != varName {
+			continue
+		}
+		trimmed := strings.TrimRight(line, "\r\n")
+		_, value, ok := strings.Cut(trimmed, "=")
+		if !ok {
+			return "", false
+		}
+		value = strings.TrimSpace(value)
+		value = strings.Trim(value, `"'`)
+		return value, true
+	}
+	return "", false
+}
+
+func envValueQuote(line string) string {
+	trimmed := strings.TrimRight(line, "\r\n")
+	_, value, ok := strings.Cut(trimmed, "=")
+	if !ok {
+		return ""
+	}
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && value[0] == value[len(value)-1] && (value[0] == '\'' || value[0] == '"') {
+		return string(value[0])
+	}
+	return ""
+}
+
+func quoteEnvValue(value string, quote string) string {
+	switch quote {
+	case "'":
+		if strings.Contains(value, "'") {
+			return value
+		}
+		return "'" + value + "'"
+	case `"`:
+		escaped := strings.ReplaceAll(value, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+		return `"` + escaped + `"`
+	default:
+		return value
+	}
+}
+
+func sortedKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func AllocateLocalPort() (int, error) {

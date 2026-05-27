@@ -29,7 +29,7 @@ func TestProjectTemplate(t *testing.T) {
 		t.Fatalf("workspaces = %#v", loaded.Workspaces)
 	}
 	template := ProjectTemplate()
-	for _, want := range []string{"# worktree_dir: ~/workspace/worktrees", "# tmux_mode: window", "# workspace_mode: single", "# files:", "# hooks:", "#   post_create:", "# randomize_ports:", "#       - PORT", "# panes:"} {
+	for _, want := range []string{"# worktree_dir: ~/workspace/worktrees", "# tmux_mode: window", "# workspace_mode: single", "# files:", "# hooks:", "#   post_create:", "# randomize_ports:", "#       - PORT", "# set_env:", "#       API_URL:", "# open:", "# panes:"} {
 		if !strings.Contains(template, want) {
 			t.Fatalf("template missing %q:\n%s", want, template)
 		}
@@ -121,6 +121,12 @@ func TestLoadProjectConfig(t *testing.T) {
 		"        vars:",
 		"          - PORT",
 		"          - APP_PORT",
+		"    set_env:",
+		"      - file: .env.local",
+		"        vars:",
+		"          API_URL: http://localhost:${backend:PORT}/api",
+		"    open:",
+		"      - http://localhost:${backend:PORT}/api",
 		"",
 	}, "\n"))
 
@@ -151,6 +157,11 @@ func TestLoadProjectConfig(t *testing.T) {
 		t.Fatalf("randomize ports = %#v", randomizePorts)
 	}
 	assertSlice(t, randomizePorts[0].Vars, []string{"PORT", "APP_PORT"})
+	setEnv := config.Workspaces[1].SetEnv
+	if len(setEnv) != 1 || setEnv[0].File != ".env.local" || setEnv[0].Vars["API_URL"] != "http://localhost:${backend:PORT}/api" {
+		t.Fatalf("set env = %#v", setEnv)
+	}
+	assertSlice(t, config.Workspaces[1].Open, []string{"http://localhost:${backend:PORT}/api"})
 }
 
 func TestLoadProjectConfigLegacyAliases(t *testing.T) {
@@ -229,6 +240,11 @@ func TestLoadFileRejectsInvalidConfig(t *testing.T) {
 	emptyRandomizePortVars := filepath.Join(root, "empty-randomize-port-vars.yaml")
 	badRandomizePortVar := filepath.Join(root, "bad-randomize-port-var.yaml")
 	duplicateRandomizePortVar := filepath.Join(root, "duplicate-randomize-port-var.yaml")
+	unsafeSetEnvFile := filepath.Join(root, "unsafe-set-env-file.yaml")
+	emptySetEnvVars := filepath.Join(root, "empty-set-env-vars.yaml")
+	badSetEnvVar := filepath.Join(root, "bad-set-env-var.yaml")
+	emptySetEnvTemplate := filepath.Join(root, "empty-set-env-template.yaml")
+	emptyOpen := filepath.Join(root, "empty-open.yaml")
 
 	write(t, invalidYAML, "workspaces: [\n")
 	write(t, legacyCopy, "copy:\n  - .env\n")
@@ -251,6 +267,11 @@ func TestLoadFileRejectsInvalidConfig(t *testing.T) {
 	write(t, emptyRandomizePortVars, "workspaces:\n  - name: app\n    randomize_ports:\n      - file: .env\n")
 	write(t, badRandomizePortVar, "workspaces:\n  - name: app\n    randomize_ports:\n      - file: .env\n        vars:\n          - APP-PORT\n")
 	write(t, duplicateRandomizePortVar, "workspaces:\n  - name: app\n    randomize_ports:\n      - file: .env\n        vars:\n          - PORT\n          - PORT\n")
+	write(t, unsafeSetEnvFile, "workspaces:\n  - name: app\n    set_env:\n      - file: ../.env\n        vars:\n          URL: http://localhost:3000\n")
+	write(t, emptySetEnvVars, "workspaces:\n  - name: app\n    set_env:\n      - file: .env\n")
+	write(t, badSetEnvVar, "workspaces:\n  - name: app\n    set_env:\n      - file: .env\n        vars:\n          APP-URL: http://localhost:3000\n")
+	write(t, emptySetEnvTemplate, "workspaces:\n  - name: app\n    set_env:\n      - file: .env\n        vars:\n          URL: ''\n")
+	write(t, emptyOpen, "workspaces:\n  - name: app\n    open:\n      - ''\n")
 
 	loadErrorContains(t, invalidYAML, "invalid YAML")
 	loadErrorContains(t, legacyCopy, "legacy key")
@@ -273,6 +294,11 @@ func TestLoadFileRejectsInvalidConfig(t *testing.T) {
 	loadErrorContains(t, emptyRandomizePortVars, "must define at least one variable")
 	loadErrorContains(t, badRandomizePortVar, "valid env var name")
 	loadErrorContains(t, duplicateRandomizePortVar, "duplicate randomize port var")
+	loadErrorContains(t, unsafeSetEnvFile, `cannot contain ".."`)
+	loadErrorContains(t, emptySetEnvVars, "must define at least one variable")
+	loadErrorContains(t, badSetEnvVar, "valid env var name")
+	loadErrorContains(t, emptySetEnvTemplate, "must be a non-empty string")
+	loadErrorContains(t, emptyOpen, "must be a non-empty string")
 }
 
 func TestWorkspaceDirEnvKey(t *testing.T) {

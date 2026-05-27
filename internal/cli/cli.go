@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/alienxp03/wktree/internal/config"
@@ -52,6 +53,12 @@ type workspaceWorktree struct {
 	Worktree git.Worktree
 }
 
+type workspacePlan struct {
+	plan   setup.Plan
+	logger setup.Logger
+	open   []string
+}
+
 func Run(args []string, options Options) int {
 	app := normalizeOptions(options)
 	ctx := context.Background()
@@ -76,6 +83,8 @@ func Run(args []string, options Options) int {
 		exitCode, err = runList(ctx, args[1:], app)
 	case "new":
 		exitCode, err = runNew(ctx, args[1:], app)
+	case "close":
+		exitCode, err = runClose(ctx, args[1:], app)
 	case "remove":
 		exitCode, err = runRemove(ctx, args[1:], app)
 	case "switch":
@@ -116,6 +125,12 @@ func runComplete(ctx context.Context, args []string, options Options) (int, erro
 		values = nil
 	case "new":
 		values, err = completeWorktreeCommand(ctx, options, prefix, []string{"--home", "--from", "--workspaces"})
+	case "close":
+		if strings.HasPrefix(prefix, "-") {
+			values = filterPrefix([]string{"--dry-run", "--workspaces"}, prefix)
+		} else {
+			values, err = git.CompleteCloseBranches(ctx, options.Cwd, prefix, options.Runner)
+		}
 	case "remove":
 		if strings.HasPrefix(prefix, "-") {
 			values = filterPrefix([]string{"--force", "--dry-run", "--workspaces"}, prefix)
@@ -125,7 +140,7 @@ func runComplete(ctx context.Context, args []string, options Options) (int, erro
 	case "switch":
 		values, err = completeWorktreeCommand(ctx, options, prefix, []string{"--home", "--workspaces", "--pr"})
 	default:
-		values = filterPrefix([]string{"doctor", "list", "new", "remove", "switch", "init", "completion"}, prefix)
+		values = filterPrefix([]string{"doctor", "list", "new", "close", "remove", "switch", "init", "completion"}, prefix)
 	}
 	if err != nil {
 		return 1, err
@@ -326,7 +341,7 @@ func runRemove(ctx context.Context, args []string, options Options) (int, error)
 		targets = append(targets, target)
 	}
 	if !selection.AllWorkspaces {
-		if err := ensureSingleWorkspaceRemove(parsed.Branch, selection.Workspaces[0], targets[0]); err != nil {
+		if err := ensureSingleWorkspaceLayout(parsed.Branch, "remove", selection.Workspaces[0], targets[0]); err != nil {
 			return 1, err
 		}
 	}
@@ -336,25 +351,68 @@ func runRemove(ctx context.Context, args []string, options Options) (int, error)
 	}
 	if !parsed.Force {
 		for index, target := range targets {
+			logRemoveProgress(options.Stdout, selection.Workspaces[index], "checking clean worktree")
 			if err := git.EnsureCleanWorktree(ctx, target, options.Runner); err != nil {
 				return 1, fmt.Errorf("%s: %w", selection.Workspaces[index].Name, err)
 			}
 		}
 	}
 	for index, target := range targets {
+		logRemoveProgress(options.Stdout, selection.Workspaces[index], "cleaning generated workspace env")
 		if err := removeGeneratedContextEnv(selection.Workspaces[index], target.WorktreePath); err != nil {
 			return 1, fmt.Errorf("%s: %w", selection.Workspaces[index].Name, err)
 		}
 	}
+	logRemoveProgress(options.Stdout, workspaceSpec{}, "closing tmux targets")
 	if err := killWorkspaceTmux(ctx, selection, parsed.Branch, options); err != nil {
 		return 1, err
 	}
 	for index, target := range targets {
-		if err := git.RemoveWorktree(ctx, target, parsed.Force, options.Runner); err != nil {
+		logRemoveProgress(options.Stdout, selection.Workspaces[index], "removing git worktree")
+		if err := git.RemoveWorktreePath(ctx, target, parsed.Force, options.Runner); err != nil {
+			return 1, fmt.Errorf("%s: %w", selection.Workspaces[index].Name, err)
+		}
+		logRemoveProgress(options.Stdout, selection.Workspaces[index], "deleting local branch")
+		if err := git.DeleteBranch(ctx, target, parsed.Force, options.Runner); err != nil {
 			return 1, fmt.Errorf("%s: %w", selection.Workspaces[index].Name, err)
 		}
 	}
 	fmt.Fprintf(options.Stdout, "removed %s\n", parsed.Branch)
+	return 0, nil
+}
+
+func runClose(ctx context.Context, args []string, options Options) (int, error) {
+	parsed, err := parseCloseArgs(args)
+	if err != nil {
+		return 1, err
+	}
+	selection, err := resolveWorkspaceSelection(ctx, options, "", parsed.Workspaces)
+	if err != nil {
+		return 1, err
+	}
+
+	targets := make([]git.RemoveTarget, 0, len(selection.Workspaces))
+	for _, workspace := range selection.Workspaces {
+		target, err := git.ResolveCloseTarget(ctx, git.RemoveOptions{Branch: parsed.Branch, Cwd: workspace.RepoRoot, Runner: options.Runner})
+		if err != nil {
+			return 1, fmt.Errorf("%s: %w", workspace.Name, err)
+		}
+		targets = append(targets, target)
+	}
+	if !selection.AllWorkspaces {
+		if err := ensureSingleWorkspaceLayout(parsed.Branch, "close", selection.Workspaces[0], targets[0]); err != nil {
+			return 1, err
+		}
+	}
+	if parsed.DryRun {
+		fmt.Fprint(options.Stdout, renderCloseDryRun(selection, parsed.Branch, targets))
+		return 0, nil
+	}
+	logCommandProgress(options.Stdout, "close", workspaceSpec{}, "closing tmux targets")
+	if err := killWorkspaceTmux(ctx, selection, parsed.Branch, options); err != nil {
+		return 1, err
+	}
+	fmt.Fprintf(options.Stdout, "closed %s\n", parsed.Branch)
 	return 0, nil
 }
 
@@ -389,6 +447,34 @@ func parseRemoveArgs(args []string) (removeArgs, error) {
 	return parsed, nil
 }
 
+type closeArgs struct {
+	Branch     string
+	DryRun     bool
+	Workspaces bool
+}
+
+func parseCloseArgs(args []string) (closeArgs, error) {
+	parsed := closeArgs{}
+	positionals := []string{}
+	for _, arg := range args {
+		switch {
+		case arg == "--dry-run":
+			parsed.DryRun = true
+		case arg == "--workspaces":
+			parsed.Workspaces = true
+		case strings.HasPrefix(arg, "-"):
+			return closeArgs{}, fmt.Errorf("unknown option: %s", arg)
+		default:
+			positionals = append(positionals, arg)
+		}
+	}
+	if len(positionals) != 1 {
+		return closeArgs{}, fmt.Errorf("usage: wktree close [--dry-run] [--workspaces] <branch>")
+	}
+	parsed.Branch = positionals[0]
+	return parsed, nil
+}
+
 func renderRemoveDryRun(selection workspaceSelection, branch string, targets []git.RemoveTarget, force bool) string {
 	worktreeRemove := "git worktree remove"
 	branchDelete := "git branch -d"
@@ -417,6 +503,35 @@ func renderRemoveDryRun(selection workspaceSelection, branch string, targets []g
 	return output.String()
 }
 
+func renderCloseDryRun(selection workspaceSelection, branch string, targets []git.RemoveTarget) string {
+	var output strings.Builder
+	fmt.Fprintln(&output, "dry run: close")
+	fmt.Fprintf(&output, "branch: %s\n", branch)
+	fmt.Fprintf(&output, "tmux mode: %s\n", effectiveTmuxMode(selection))
+	for index, target := range targets {
+		workspace := selection.Workspaces[index]
+		fmt.Fprintf(&output, "workspace: %s\n", workspace.Name)
+		fmt.Fprintf(&output, "  worktree: %s\n", target.WorktreePath)
+	}
+	fmt.Fprintln(&output, "actions:")
+	for _, action := range tmuxRemovalActions(selection, branch) {
+		fmt.Fprintf(&output, "  %s\n", action)
+	}
+	return output.String()
+}
+
+func logRemoveProgress(writer io.Writer, workspace workspaceSpec, message string) {
+	logCommandProgress(writer, "remove", workspace, message)
+}
+
+func logCommandProgress(writer io.Writer, command string, workspace workspaceSpec, message string) {
+	if workspace.Name == "" {
+		fmt.Fprintf(writer, "%s: %s\n", command, message)
+		return
+	}
+	fmt.Fprintf(writer, "%s: %s: %s\n", command, workspace.Name, message)
+}
+
 func finishWorkspaceCommand(ctx context.Context, selection workspaceSelection, branch string, worktrees []workspaceWorktree, options Options) (int, error) {
 	return finishWorkspaceCommandWithContext(ctx, selection, branch, worktrees, nil, options)
 }
@@ -425,14 +540,32 @@ func finishWorkspaceCommandWithContext(ctx context.Context, selection workspaceS
 	contexts := workspaceContexts(branch, worktrees)
 	baseLogger := setup.Logger{Stdout: options.Stdout, Stderr: options.Stderr}
 	status := 0
+	plans := make([]workspacePlan, 0, len(worktrees))
 	for _, worktree := range worktrees {
 		files := config.WorkspaceFiles(selection.Config, worktree.Spec.Config)
 		hooks := config.WorkspaceHooks(selection.Config, worktree.Spec.Config)
 		context := contexts[worktree.Spec.Name]
 		context.PullRequest = prContext
-		plan := setup.NewPlan(worktree.Spec.WorkspaceRoot, workspacePath(worktree.Spec, worktree.Worktree.WorktreePath), worktree.Spec.Name, branch, files, hooks, worktree.Spec.Config.RandomizePorts, worktree.Worktree.Reused, context)
-		logger := workspaceLogger(baseLogger, selection, worktree.Spec)
-		if setup.Run(ctx, plan, logger, options.ShellRunner) != 0 {
+		plan := setup.NewPlan(worktree.Spec.WorkspaceRoot, workspacePath(worktree.Spec, worktree.Worktree.WorktreePath), worktree.Spec.Name, branch, files, hooks, worktree.Spec.Config.RandomizePorts, worktree.Spec.Config.SetEnv, worktree.Worktree.Reused, context)
+		plans = append(plans, workspacePlan{plan: plan, logger: workspaceLogger(baseLogger, selection, worktree.Spec), open: append([]string(nil), worktree.Spec.Config.Open...)})
+	}
+	for _, item := range plans {
+		if setup.RunPrepare(item.plan, item.logger) != 0 {
+			status = 1
+		}
+	}
+	for _, item := range plans {
+		if setup.SetEnvFiles(item.plan, item.logger) != 0 {
+			status = 1
+		}
+	}
+	for _, item := range plans {
+		if setup.WriteContextEnvLogged(item.plan, item.logger) != 0 {
+			status = 1
+		}
+	}
+	for _, item := range plans {
+		if setup.RunPostCreate(ctx, item.plan, item.logger, options.ShellRunner) != 0 {
 			status = 1
 		}
 	}
@@ -450,7 +583,11 @@ func finishWorkspaceCommandWithContext(ctx context.Context, selection workspaceS
 	if status != 0 {
 		return status, nil
 	}
-	return openStatus, nil
+	if openStatus != 0 {
+		return openStatus, nil
+	}
+	openWorkspaceURLs(ctx, plans, options.Runner)
+	return 0, nil
 }
 
 func workspaceLogger(base setup.Logger, selection workspaceSelection, workspace workspaceSpec) setup.Logger {
@@ -458,6 +595,46 @@ func workspaceLogger(base setup.Logger, selection workspaceSelection, workspace 
 		base.Prefix = workspace.Name
 	}
 	return base
+}
+
+func openWorkspaceURLs(ctx context.Context, plans []workspacePlan, runner run.Runner) {
+	for _, item := range plans {
+		for _, template := range item.open {
+			url, err := setup.RenderSetEnvTemplate(template, item.plan.Context)
+			if err != nil {
+				item.logger.Warn("failed to resolve open URL %q: %s", template, err)
+				continue
+			}
+			if err := openURL(ctx, url, runner); err != nil {
+				item.logger.Warn("failed to open %s: %s", url, err)
+				continue
+			}
+			item.logger.Info("opened %s", url)
+		}
+	}
+}
+
+func openURL(ctx context.Context, url string, runner run.Runner) error {
+	if runner == nil {
+		runner = run.DefaultRunner{}
+	}
+	command, args := openCommand(url)
+	result := runner.Run(ctx, command, args, run.Options{})
+	if result.Err != nil || result.ExitCode != 0 {
+		return fmt.Errorf("%s", run.FailureMessage(command, args, result))
+	}
+	return nil
+}
+
+func openCommand(url string) (string, []string) {
+	switch runtime.GOOS {
+	case "darwin":
+		return "open", []string{url}
+	case "windows":
+		return "cmd", []string{"/c", "start", "", url}
+	default:
+		return "xdg-open", []string{url}
+	}
 }
 
 func ensurePullRequestTargetManaged(workspace workspaceSpec, target git.PullRequestTarget) error {
@@ -708,13 +885,13 @@ func killWorkspaceTmux(ctx context.Context, selection workspaceSelection, branch
 	})
 }
 
-func ensureSingleWorkspaceRemove(branch string, workspace workspaceSpec, target git.RemoveTarget) error {
+func ensureSingleWorkspaceLayout(branch string, command string, workspace workspaceSpec, target git.RemoveTarget) error {
 	count, err := setup.ContextEnvWorkspaceDirCount(workspacePath(workspace, target.WorktreePath))
 	if err != nil {
 		return err
 	}
 	if count > 1 {
-		return fmt.Errorf("branch appears to use multiple workspaces from .wktree.env; rerun with --workspaces to remove all: %s", branch)
+		return fmt.Errorf("branch appears to use multiple workspaces from .wktree.env; rerun with --workspaces to %s all: %s", command, branch)
 	}
 	return nil
 }
@@ -1035,6 +1212,7 @@ Usage:
   wktree doctor
   wktree list
   wktree new [--home <path>] [--from <ref>] [--workspaces] <branch>
+  wktree close [--dry-run] [--workspaces] <branch>
   wktree remove [--force] [--dry-run] [--workspaces] <branch>
   wktree switch [--home <path>] [--workspaces] <branch>
   wktree switch [--home <path>] --pr <number|url>
@@ -1049,6 +1227,7 @@ Examples:
   wktree new --from main feature/example
   wktree new --workspaces feature/example
   wktree switch --pr 123
+  wktree close --workspaces feature/example
   wktree remove --dry-run --workspaces feature/example
   wktree switch --workspaces feature/example
   eval "$(wktree completion zsh)"
@@ -1056,7 +1235,7 @@ Examples:
 Setup config:
   Create:  wktree init
   Project: nearest .wktree.yaml
-  Keys:    worktree_dir, tmux_mode, workspace_mode, defaults, workspaces, panes, files, hooks
+  Keys:    worktree_dir, tmux_mode, workspace_mode, defaults, workspaces, panes, files, hooks, set_env, open
 
 Shell integration:
   eval "$(wktree completion zsh)"

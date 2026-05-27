@@ -334,6 +334,86 @@ func TestRunRandomizesNewlyCopiedEnvWhenReused(t *testing.T) {
 	}
 }
 
+func TestSetEnvFilesUsesWorkspaceTemplates(t *testing.T) {
+	root := t.TempDir()
+	repoAPath := filepath.Join(root, "repo_a")
+	repoBPath := filepath.Join(root, "repo_b")
+	must(t, os.MkdirAll(repoAPath, 0o755))
+	must(t, os.MkdirAll(repoBPath, 0o755))
+	write(t, filepath.Join(repoAPath, ".env"), "PORT=58372\n")
+	write(t, filepath.Join(repoAPath, ".env.local"), "API_PORT='58373'\n")
+	write(t, filepath.Join(repoBPath, ".env"), strings.Join([]string{
+		"URL=http://localhost:5001/url",
+		"export API_URL='http://localhost:5002/api'",
+		"OTHER=${HOST}",
+		"",
+	}, "\n"))
+	logger, stdout, _ := captureLogger()
+
+	status := SetEnvFiles(Plan{
+		WorktreePath: repoBPath,
+		SetEnv: []config.SetEnv{
+			{
+				File: ".env",
+				Vars: map[string]string{
+					"URL":       "http://localhost:${repo_a:PORT}/url",
+					"API_URL":   "http://localhost:${repo_a:.env.local:API_PORT}/api",
+					"OTHER":     "${HOST}",
+					"ADDED_URL": "http://localhost:${repo_a:PORT}/added",
+				},
+			},
+		},
+		Context: Context{WorkspacePaths: map[string]string{
+			"repo_a": repoAPath,
+			"repo_b": repoBPath,
+		}},
+	}, logger)
+
+	if status != 0 {
+		t.Fatalf("status = %d", status)
+	}
+	got := read(t, filepath.Join(repoBPath, ".env"))
+	for _, want := range []string{
+		"URL=http://localhost:58372/url",
+		"export API_URL='http://localhost:58373/api'",
+		"OTHER=${HOST}",
+		"ADDED_URL=http://localhost:58372/added",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("env missing %q:\n%s", want, got)
+		}
+	}
+	if !strings.Contains(stdout.String(), "set env in .env") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestSetEnvFilesFailsForMissingTemplateSource(t *testing.T) {
+	root := t.TempDir()
+	repoBPath := filepath.Join(root, "repo_b")
+	must(t, os.MkdirAll(repoBPath, 0o755))
+	write(t, filepath.Join(repoBPath, ".env"), "URL=http://localhost:5001/url\n")
+	logger, _, stderr := captureLogger()
+
+	status := SetEnvFiles(Plan{
+		WorktreePath: repoBPath,
+		SetEnv: []config.SetEnv{
+			{File: ".env", Vars: map[string]string{"URL": "http://localhost:${repo_a:PORT}/url"}},
+		},
+		Context: Context{WorkspacePaths: map[string]string{"repo_b": repoBPath}},
+	}, logger)
+
+	if status != 1 {
+		t.Fatalf("status = %d", status)
+	}
+	if !strings.Contains(stderr.String(), `unknown workspace "repo_a"`) {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if got := read(t, filepath.Join(repoBPath, ".env")); got != "URL=http://localhost:5001/url\n" {
+		t.Fatalf("env should not change on failure: %q", got)
+	}
+}
+
 func TestRandomizeEnvPortsMissingFileWarnsWithoutFailure(t *testing.T) {
 	root := t.TempDir()
 	worktreePath := filepath.Join(root, "worktree")

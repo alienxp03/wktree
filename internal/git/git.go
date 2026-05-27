@@ -155,6 +155,28 @@ func CompleteRemoveBranches(ctx context.Context, cwd string, prefix string, runn
 	return filterPrefix(uniqueSorted(names), paths.StripOriginPrefix(prefix)), nil
 }
 
+func CompleteCloseBranches(ctx context.Context, cwd string, prefix string, runner run.Runner) ([]string, error) {
+	if runner == nil {
+		runner = run.DefaultRunner{}
+	}
+	repoRoot, err := RepoRoot(ctx, cwd, runner)
+	if err != nil {
+		return nil, err
+	}
+	worktrees, err := listWorktrees(ctx, repoRoot, runner)
+	if err != nil {
+		return nil, err
+	}
+	names := []string{}
+	for _, worktree := range worktrees {
+		if worktree.Detached || worktree.Branch == "" {
+			continue
+		}
+		names = append(names, worktree.Branch)
+	}
+	return filterPrefix(uniqueSorted(names), paths.StripOriginPrefix(prefix)), nil
+}
+
 func CreateWorktree(ctx context.Context, options CreateOptions) (Worktree, error) {
 	target, err := ResolveCreateWorktree(ctx, options)
 	if err != nil {
@@ -352,7 +374,47 @@ func ResolveRemoveTarget(ctx context.Context, options RemoveOptions) (RemoveTarg
 	return RemoveTarget{Branch: branch, RepoRoot: repoRoot, WorktreePath: worktreePath}, nil
 }
 
+func ResolveCloseTarget(ctx context.Context, options RemoveOptions) (RemoveTarget, error) {
+	runner := options.Runner
+	if runner == nil {
+		runner = run.DefaultRunner{}
+	}
+	branch := paths.StripOriginPrefix(options.Branch)
+	if branch == "" {
+		return RemoveTarget{}, fmt.Errorf("branch name is required")
+	}
+
+	repoRoot, err := RepoRoot(ctx, options.Cwd, runner)
+	if err != nil {
+		return RemoveTarget{}, err
+	}
+	if err := ensureBranchName(ctx, repoRoot, branch, runner); err != nil {
+		return RemoveTarget{}, err
+	}
+	if exists, err := refExists(ctx, repoRoot, "refs/heads/"+branch, runner); err != nil {
+		return RemoveTarget{}, err
+	} else if !exists {
+		return RemoveTarget{}, fmt.Errorf("local branch does not exist: %s", branch)
+	}
+
+	worktreePath, ok, err := checkedOutWorktree(ctx, repoRoot, branch, runner)
+	if err != nil {
+		return RemoveTarget{}, err
+	}
+	if !ok {
+		return RemoveTarget{}, fmt.Errorf("branch has no worktree: %s", branch)
+	}
+	return RemoveTarget{Branch: branch, RepoRoot: repoRoot, WorktreePath: worktreePath}, nil
+}
+
 func RemoveWorktree(ctx context.Context, target RemoveTarget, force bool, runner run.Runner) error {
+	if err := RemoveWorktreePath(ctx, target, force, runner); err != nil {
+		return err
+	}
+	return DeleteBranch(ctx, target, force, runner)
+}
+
+func RemoveWorktreePath(ctx context.Context, target RemoveTarget, force bool, runner run.Runner) error {
 	if runner == nil {
 		runner = run.DefaultRunner{}
 	}
@@ -364,6 +426,13 @@ func RemoveWorktree(ctx context.Context, target RemoveTarget, force bool, runner
 	removed := runGit(ctx, runner, target.RepoRoot, removeArgs, false)
 	if removed.Err != nil || removed.ExitCode != 0 {
 		return errors.New(run.FailureMessage("git", removeArgs, removed))
+	}
+	return nil
+}
+
+func DeleteBranch(ctx context.Context, target RemoveTarget, force bool, runner run.Runner) error {
+	if runner == nil {
+		runner = run.DefaultRunner{}
 	}
 	deleteArgs := []string{"branch", "-d"}
 	if force {

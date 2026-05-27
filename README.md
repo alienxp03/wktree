@@ -39,6 +39,8 @@ wktree new --workspaces feature/example
 wktree switch feature/example
 wktree switch --pr 123
 wktree switch --workspaces feature/example
+wktree close feature/example
+wktree close --dry-run --workspaces feature/example
 wktree remove feature/example
 wktree remove --dry-run --workspaces feature/example
 wktree remove --force --workspaces feature/example
@@ -52,7 +54,9 @@ wktree remove --force --workspaces feature/example
 
 `wktree switch --pr <number-or-url>` opens a GitHub pull request for the current repo only. It requires the GitHub CLI, fetches the PR head from `origin`, uses the PR contributor branch name for the local branch and worktree, and ignores workspace fan-out even when `workspace_mode: all` is configured.
 
-`wktree remove <branch>` kills the matching tmux window or session target, removes the branch worktree, and deletes the local branch with Git's safe deletion rules. It does not remove remote branches. Use `--dry-run` to preview the tmux and Git actions. Use `--force` to remove a dirty worktree and force-delete the local branch. If `.wktree.env` shows that the branch was opened with multiple workspaces, single-workspace remove stops and asks for `--workspaces`.
+`wktree close <branch>` closes the matching tmux window or session target without deleting the worktree, local branch, or generated `.wktree.env`. Use `--dry-run` to preview the tmux action. If `.wktree.env` shows that the branch was opened with multiple workspaces, single-workspace close stops and asks for `--workspaces`.
+
+`wktree remove <branch>` kills the matching tmux window or session target, removes the branch worktree, and deletes the local branch with Git's safe deletion rules. It prints progress before each remove step so slow Git or tmux operations show where they are. It does not remove remote branches. Use `--dry-run` to preview the tmux and Git actions. Use `--force` to remove a dirty worktree and force-delete the local branch. If `.wktree.env` shows that the branch was opened with multiple workspaces, single-workspace remove stops and asks for `--workspaces`.
 
 `wktree list` shows every Git worktree for the current repository, including the primary checkout.
 
@@ -141,6 +145,12 @@ workspaces:
         vars:
           - PORT
           - APP_PORT
+    set_env:
+      - file: .env.local
+        vars:
+          API_URL: "http://localhost:${backend:.env.local:PORT}/api"
+    open:
+      - "http://localhost:${backend:.env.local:PORT}/api"
     panes:
       - command: nvim
         focus: true
@@ -164,7 +174,7 @@ workspaces:
         split: horizontal
 ```
 
-`workspaces` is ordered. With `workspace_mode: single`, `wktree` uses the first item unless `--workspaces` is passed. With `workspace_mode: all`, `new`, `switch`, and `remove` use every workspace by default.
+`workspaces` is ordered. With `workspace_mode: single`, `wktree` uses the first item unless `--workspaces` is passed. With `workspace_mode: all`, `new`, `switch`, `close`, and `remove` use every workspace by default.
 
 All-workspace runs always use a branch-scoped tmux session, regardless of `tmux_mode`. `tmux_mode` only controls single-workspace runs.
 
@@ -194,6 +204,46 @@ workspaces:
 ```
 
 Fresh worktrees get new port values. Switching back to an existing worktree preserves valid numeric values already present in the copied env files.
+
+`set_env` updates named env variables after every selected workspace has copied files and randomized ports. Template references use `${workspace:VAR}` to read `VAR` from that workspace's `.env`, or `${workspace:file:VAR}` to read another env file:
+
+```yaml
+workspaces:
+  - name: repo_a
+    files:
+      copy:
+        - .env
+        - .env.local
+    randomize_ports:
+      - file: .env
+        vars:
+          - PORT
+      - file: .env.local
+        vars:
+          - API_PORT
+
+  - name: repo_b
+    files:
+      copy:
+        - .env
+    set_env:
+      - file: .env
+        vars:
+          URL: "http://localhost:${repo_a:PORT}/url"
+          API_URL: "http://localhost:${repo_a:.env.local:API_PORT}/api"
+```
+
+If a target variable is missing, `set_env` appends it. Template references without `:` are left unchanged, so existing shell-style values such as `${HOST}` remain intact.
+
+`open` launches one or more URL templates after setup completes and tmux panes are created. It uses the same template references as `set_env`, warns instead of failing if the opener command fails, and does not wait for the dev server to become ready:
+
+```yaml
+workspaces:
+  - name: app
+    open:
+      - "http://localhost:${app:PORT}"
+      - "http://localhost:${app:PORT}/graphql"
+```
 
 ## Workspace Env
 
@@ -245,7 +295,7 @@ eval "$(wktree completion zsh)"
 eval "$(wktree completion bash)"
 ```
 
-Completion includes commands, flags, existing local and `origin` branches for `switch`, and removable worktree branches for `remove`.
+Completion includes commands, flags, existing local and `origin` branches for `switch`, and closable/removable worktree branches for `close` and `remove`.
 
 ## Troubleshooting
 
