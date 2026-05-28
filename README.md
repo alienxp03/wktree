@@ -1,6 +1,15 @@
 # wktree
 
-Create strict Git worktrees from the current `HEAD` or another ref, then open a tmux workspace for one repo or a related set of repos.
+`git worktree` + `tmux` for one or multiple repos.
+
+## Motivation
+
+- In my daily workflow, I heavily use tmux and neovim. Terminal is my IDE. 
+- I quite like using `git worktree` since I can easily isolate my workspace in case I need to work on multiple features at once, or for checking out PRs locally.
+- It's common for me to work across multipe repos for one feature. For example `repo_backend` and `repo_frontend`.
+- I really like [workmux](https://github.com/raine/workmux) but it doesn't support multiple repos (yet). 
+- I use Ghostty btw.
+
 
 ## Install
 
@@ -17,75 +26,14 @@ brew install wktree
 go install github.com/alienxp03/wktree/cmd/wktree@latest
 ```
 
-For local development from this repository:
+## Setup
 
-```bash
-make build
-./dist/wktree --help
-```
 
-Install the local build to your user bin path:
-
-```bash
-make install
-```
-
-This installs to `~/.local/bin/wktree` by default. Override the target directory with:
-
-```bash
-make install INSTALL_DIR="$HOME/bin"
-```
-
-## Usage
+Create a starter config in the current directory with:
 
 ```bash
 wktree init
-wktree doctor
-wktree list
-wktree list --pr
-wktree new feature/example
-wktree new --from main feature/example
-wktree new --workspaces feature/example
-wktree switch feature/example
-wktree switch --pr 123
-wktree switch --force --pr 123
-wktree switch --workspaces feature/example
-wktree close feature/example
-wktree close --dry-run --workspaces feature/example
-wktree remove feature/example
-wktree remove --dry-run --workspaces feature/example
-wktree remove --force --workspaces feature/example
 ```
-
-`wktree new <branch>` creates a new branch and worktree for the first configured workspace. Use `--from <ref>` to create the branch from another local branch, remote branch, tag, or commit.
-
-`wktree new --workspaces <branch>` creates the same branch across every configured workspace repo and opens them together in tmux.
-
-`wktree switch <branch>` opens an existing branch worktree. If the branch exists but has no worktree yet, it creates one. If only `origin/<branch>` exists, it creates a local tracking branch and worktree.
-
-`wktree switch --pr <number-or-url>` opens a GitHub pull request for the current repo only. It requires the GitHub CLI, fetches the PR head from `origin`, uses the PR contributor branch name for the local branch and worktree, and ignores workspace fan-out even when `workspace_mode: all` is configured. If the PR branch already exists locally but is not managed as a PR worktree, use `--force` to check out that branch into the PR worktree path and hard-reset it to the fetched PR head.
-
-`wktree close <branch>` closes the matching tmux window or session target without deleting the worktree, local branch, or generated `.wktree.env`. Use `--dry-run` to preview the tmux action. If `.wktree.env` shows that the branch was opened with multiple workspaces, single-workspace close stops and asks for `--workspaces`.
-
-`wktree remove <branch>` kills the matching tmux window or session target, removes the branch worktree, and deletes the local branch with Git's safe deletion rules. It prints progress before each remove step so slow Git or tmux operations show where they are. It does not remove remote branches. Use `--dry-run` to preview the tmux and Git actions. Use `--force` to remove a dirty worktree and force-delete the local branch. If `.wktree.env` shows that the branch was opened with multiple workspaces, single-workspace remove stops and asks for `--workspaces`.
-
-`wktree list` shows every Git worktree for the current repository, including the primary checkout. Use `wktree list --pr` to add a PR column for open GitHub PRs matching local branch names. PR lookup requires the GitHub CLI and is best-effort, so list still succeeds if lookup fails.
-
-By default, worktrees are created under:
-
-```text
-~/workspace/worktrees
-```
-
-The target path format is:
-
-```text
-<worktree_home>/<owner_slug>/<repo_slug>/<branch_slug>
-```
-
-For GitHub remotes, `owner_slug` and `repo_slug` come from the remote URL. Without a supported remote, `owner_slug` comes from `git config user.name` and `repo_slug` comes from the repo directory name.
-
-## Config
 
 `wktree` searches from the current directory up to the Git root and uses the nearest project-local config:
 
@@ -93,11 +41,6 @@ For GitHub remotes, `owner_slug` and `repo_slug` come from the remote URL. Witho
 .wktree.yaml
 ```
 
-Create a starter config in the current directory with:
-
-```bash
-wktree init
-```
 
 In a monorepo, this means `wktree init` can be run from an inner project folder. Git worktree operations still use the Git repo root, while setup files, hooks, pane commands, and terminal cwd use the configured project folder in the new worktree.
 
@@ -107,13 +50,6 @@ Single-repo example:
 worktree_dir: ~/worktree
 tmux_mode: window
 workspace_mode: single
-
-defaults:
-  files:
-    copy:
-      - .env
-    symlink:
-      - AGENTS.override.md
 
 workspaces:
   - name: backend
@@ -141,6 +77,14 @@ Multi-repo example:
 ```yaml
 worktree_dir: ~/worktree
 workspace_mode: all
+
+# defaults will run for each workspace
+defaults:
+  files:
+    copy:
+      - .env
+    symlink:
+      - AGENTS.override.md
 
 workspaces:
   - name: backend
@@ -256,6 +200,55 @@ workspaces:
       - "http://localhost:${app:PORT}/graphql"
 ```
 
+## Usage
+
+```bash
+wktree init
+wktree doctor
+wktree list
+wktree list --pr
+wktree new feature/example
+wktree new --from main feature/example
+wktree new --workspaces feature/example
+wktree switch feature/example
+wktree switch --pr 123
+wktree switch --force --pr 123
+wktree switch --workspaces feature/example
+wktree close feature/example
+wktree close --dry-run --workspaces feature/example
+wktree remove feature/example
+wktree remove --dry-run --workspaces feature/example
+wktree remove --force --workspaces feature/example
+```
+
+`wktree new <branch>` creates a new branch and worktree for the first configured workspace. Use `--from <ref>` to create the branch from another local branch, remote branch, tag, or commit.
+
+`wktree new --workspaces <branch>` creates the same branch across every configured workspace repo and opens them together in tmux.
+
+`wktree switch <branch>` opens an existing branch worktree. If the branch exists but has no worktree yet, it creates one. If only `origin/<branch>` exists, it creates a local tracking branch and worktree.
+
+`wktree switch --pr <number-or-url>` opens a GitHub pull request for the current repo only. It requires the GitHub CLI, fetches the PR head from `origin`, uses the PR contributor branch name for the local branch and worktree, and ignores workspace fan-out even when `workspace_mode: all` is configured. If the PR branch already exists locally but is not managed as a PR worktree, use `--force` to check out that branch into the PR worktree path and hard-reset it to the fetched PR head.
+
+`wktree close <branch>` closes the matching tmux window or session target without deleting the worktree, local branch, or generated `.wktree.env`. Use `--dry-run` to preview the tmux action. If `.wktree.env` shows that the branch was opened with multiple workspaces, single-workspace close stops and asks for `--workspaces`.
+
+`wktree remove <branch>` kills the matching tmux window or session target, removes the branch worktree, and deletes the local branch with Git's safe deletion rules. It prints progress before each remove step so slow Git or tmux operations show where they are. It does not remove remote branches. Use `--dry-run` to preview the tmux and Git actions. Use `--force` to remove a dirty worktree and force-delete the local branch. If `.wktree.env` shows that the branch was opened with multiple workspaces, single-workspace remove stops and asks for `--workspaces`.
+
+`wktree list` shows every Git worktree for the current repository, including the primary checkout. Use `wktree list --pr` to add a PR column for open GitHub PRs matching local branch names. PR lookup requires the GitHub CLI and is best-effort, so list still succeeds if lookup fails.
+
+By default, worktrees are created under:
+
+```text
+~/workspace/worktrees
+```
+
+The target path format is:
+
+```text
+<worktree_home>/<owner_slug>/<repo_slug>/<branch_slug>
+```
+
+For GitHub remotes, `owner_slug` and `repo_slug` come from the remote URL. Without a supported remote, `owner_slug` comes from `git config user.name` and `repo_slug` comes from the repo directory name.
+
 ## Workspace Env
 
 When a workspace is created or switched, `wktree` writes:
@@ -294,6 +287,27 @@ session: <owner_slug>-<repo_slug>/<branch_slug>
 window:  <workspace_name>
 ```
 
+## Development
+
+For local development from this repository:
+
+```bash
+make build
+./dist/wktree --help
+```
+
+Install the local build to your user bin path:
+
+```bash
+make install
+```
+
+This installs to `~/.local/bin/wktree` by default. Override the target directory with:
+
+```bash
+make install INSTALL_DIR="$HOME/bin"
+```
+
 ## Shell Integration
 
 Shell integration is completion-only:
@@ -320,3 +334,8 @@ Completion includes commands, flags, existing local and `origin` branches for `s
 - `target worktree path already exists`: remove or rename the existing directory, or use `--home`.
 - `tmux ... failed`: install tmux or choose names that produce non-conflicting tmux targets.
 - `wktree doctor`: run this first when repository detection, config, or tmux looks wrong.
+
+
+### Inspiration
+
+- Inspired by [workmux](https://github.com/raine/workmux)
