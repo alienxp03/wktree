@@ -8,6 +8,11 @@
 - More than often, I need to work across multiple repos for one feature (e.g. `backend` + `frontend`). 
 - Inspired by [workmux](https://github.com/raine/workmux), but I needed multi-repo support.
 
+## Disclaimer
+- *Looks like vibe coded?* : **Yes. Good vibes only.**
+
+- *Do you even use this?* : **Yes, daily.**
+
 ## Install
 
 ### Homebrew (recommended)
