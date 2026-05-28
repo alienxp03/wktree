@@ -281,6 +281,35 @@ func TestWktreeSwitchPullRequestRejectsBranchCollision(t *testing.T) {
 	}
 }
 
+func TestWktreeSwitchPullRequestForceUsesExistingBranchCollision(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	env := testEnv(t, repo.root)
+	enableLocalOrigin(t, repo)
+	git(t, []string{"branch", "feature/collision"}, repo.sourceRoot)
+	head := pushPullRefCommit(t, repo, 123, "pr.txt", "forced\n")
+	writeFakeGh(t, env, pullRequestJSON(123, "feature/collision", head, "https://github.com/alienxp03/demo/pull/123"))
+
+	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "--force", "--pr", "123"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("force switch --pr status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+
+	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-collision")
+	if got := read(t, filepath.Join(worktreePath, "pr.txt")); got != "forced\n" {
+		t.Fatalf("pr.txt = %q", got)
+	}
+	if got := strings.TrimSpace(git(t, []string{"rev-parse", "feature/collision"}, repo.sourceRoot)); got != head {
+		t.Fatalf("branch head = %s, want %s", got, head)
+	}
+	envFile := read(t, filepath.Join(worktreePath, ".wktree.env"))
+	for _, want := range []string{"WKTREE_PR_NUMBER='123'", "WKTREE_PR_HEAD_REF='feature/collision'", "WKTREE_PR_HEAD_SHA='" + head + "'"} {
+		if !strings.Contains(envFile, want) {
+			t.Fatalf("env file missing %q:\n%s", want, envFile)
+		}
+	}
+}
+
 func TestWktreeListShowsAllWorktrees(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)
@@ -305,6 +334,35 @@ func TestWktreeListShowsAllWorktrees(t *testing.T) {
 	}
 	if !hasCurrentBranchLine(result.stdout, sourceBranch) {
 		t.Fatalf("list output missing current marker for %s:\n%s", sourceBranch, result.stdout)
+	}
+	if strings.Contains(result.stdout, "PR") {
+		t.Fatalf("default list should not include PR column:\n%s", result.stdout)
+	}
+
+	writeFakeGhList(t, env, `[{"headRefName":"feature/listed","url":"https://github.com/alienxp03/demo/pull/456"}]`)
+	result = runWktree(t, binary, []string{"list", "--pr"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("list --pr status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	for _, want := range []string{"CURRENT", "BRANCH", "HEAD", "PR", "PATH", "https://github.com/alienxp03/demo/pull/456", "(detached)"} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("list --pr output missing %q:\n%s", want, result.stdout)
+		}
+	}
+	if !strings.Contains(result.stdout, "-") {
+		t.Fatalf("list --pr output should include fallback dash for missing PRs:\n%s", result.stdout)
+	}
+
+	writeFailingGh(t, env)
+	result = runWktree(t, binary, []string{"list", "--pr"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("list --pr with failing gh status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	if !strings.Contains(result.stderr, "warning: PR lookup failed") {
+		t.Fatalf("list --pr should warn on lookup failure, stderr=%s", result.stderr)
+	}
+	if !strings.Contains(result.stdout, "PR") || !strings.Contains(result.stdout, "feature/listed") {
+		t.Fatalf("list --pr should still render worktrees on lookup failure:\n%s", result.stdout)
 	}
 }
 
@@ -1085,6 +1143,31 @@ func writeFakeGh(t *testing.T, env []string, response string) {
 	}, "\n")), 0o755))
 }
 
+func writeFakeGhList(t *testing.T, env []string, response string) {
+	t.Helper()
+	pathValue := envValue(env, "PATH")
+	binDir := strings.Split(pathValue, string(os.PathListSeparator))[0]
+	must(t, os.WriteFile(filepath.Join(binDir, "gh"), []byte(strings.Join([]string{
+		"#!/bin/sh",
+		"if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then",
+		"  cat <<'JSON'",
+		response,
+		"JSON",
+		"  exit 0",
+		"fi",
+		"echo unexpected gh args: \"$@\" >&2",
+		"exit 1",
+		"",
+	}, "\n")), 0o755))
+}
+
+func writeFailingGh(t *testing.T, env []string) {
+	t.Helper()
+	pathValue := envValue(env, "PATH")
+	binDir := strings.Split(pathValue, string(os.PathListSeparator))[0]
+	must(t, os.WriteFile(filepath.Join(binDir, "gh"), []byte("#!/bin/sh\necho gh unavailable >&2\nexit 1\n"), 0o755))
+}
+
 func pullRequestJSON(number int, headRefName string, headRefOID string, url string) string {
 	return fmt.Sprintf(`{"number":%d,"headRefName":%q,"headRefOid":%q,"url":%q}`, number, headRefName, headRefOID, url)
 }
@@ -1152,12 +1235,23 @@ func testEnv(t *testing.T, root string) []string {
 	for _, name := range []string{"open", "xdg-open"} {
 		must(t, os.WriteFile(filepath.Join(binDir, name), []byte(openScript), 0o755))
 	}
-	return append(os.Environ(),
-		"HOME="+filepath.Join(root, "home"),
-		"XDG_CONFIG_HOME="+filepath.Join(root, "xdg"),
-		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"TMUX=/tmp/tmux",
-	)
+	env := os.Environ()
+	env = setEnv(env, "HOME", filepath.Join(root, "home"))
+	env = setEnv(env, "XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	env = setEnv(env, "PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	env = setEnv(env, "TMUX", "/tmp/tmux")
+	return env
+}
+
+func setEnv(env []string, key string, value string) []string {
+	prefix := key + "="
+	for i, item := range env {
+		if strings.HasPrefix(item, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }
 
 func envValue(env []string, key string) string {

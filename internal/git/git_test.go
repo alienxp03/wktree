@@ -67,6 +67,30 @@ func TestNormalizePullRequestValue(t *testing.T) {
 	}
 }
 
+func TestPullRequestURLsByBranch(t *testing.T) {
+	got, err := PullRequestURLsByBranch(context.Background(), "/repo", []string{"feature/one", "feature/missing"}, run.RunnerFunc(func(_ context.Context, command string, args []string, options run.Options) run.Result {
+		if command != "gh" {
+			t.Fatalf("command = %q", command)
+		}
+		if options.Cwd != "/repo" {
+			t.Fatalf("cwd = %q", options.Cwd)
+		}
+		if strings.Join(args, " ") != "pr list --state open --limit 100 --json headRefName,url" {
+			t.Fatalf("args = %v", args)
+		}
+		return run.Result{Stdout: `[{"headRefName":"feature/one","url":"https://github.com/alienxp03/demo/pull/1"},{"headRefName":"other","url":"https://github.com/alienxp03/demo/pull/2"}]`}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["feature/one"] != "https://github.com/alienxp03/demo/pull/1" {
+		t.Fatalf("urls = %#v", got)
+	}
+	if _, ok := got["feature/missing"]; ok {
+		t.Fatalf("missing branch should not have URL: %#v", got)
+	}
+}
+
 func TestGeneratedStatusLineMatchesNestedContextEnv(t *testing.T) {
 	for _, line := range []string{"?? .wktree.env", "?? projects/project_a/.wktree.env", " M apps/app_a/.wktree.env"} {
 		if !isGeneratedStatusLine(line) {

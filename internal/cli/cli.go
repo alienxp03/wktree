@@ -121,8 +121,12 @@ func runComplete(ctx context.Context, args []string, options Options) (int, erro
 		values = filterPrefix([]string{"bash", "zsh"}, prefix)
 	case "init":
 		values = nil
-	case "doctor", "list":
+	case "doctor":
 		values = nil
+	case "list":
+		if strings.HasPrefix(prefix, "-") {
+			values = filterPrefix([]string{"--pr"}, prefix)
+		}
 	case "new":
 		values, err = completeWorktreeCommand(ctx, options, prefix, []string{"--home", "--from", "--workspaces"})
 	case "close":
@@ -138,7 +142,7 @@ func runComplete(ctx context.Context, args []string, options Options) (int, erro
 			values, err = git.CompleteRemoveBranches(ctx, options.Cwd, prefix, options.Runner)
 		}
 	case "switch":
-		values, err = completeWorktreeCommand(ctx, options, prefix, []string{"--home", "--workspaces", "--pr"})
+		values, err = completeWorktreeCommand(ctx, options, prefix, []string{"--home", "--workspaces", "--pr", "--force"})
 	default:
 		values = filterPrefix([]string{"doctor", "list", "new", "close", "remove", "switch", "init", "completion"}, prefix)
 	}
@@ -159,14 +163,24 @@ func completeWorktreeCommand(ctx context.Context, options Options, prefix string
 }
 
 func runList(ctx context.Context, args []string, options Options) (int, error) {
-	if len(args) != 0 {
-		return 1, fmt.Errorf("usage: wktree list")
+	parsed, err := parseListArgs(args)
+	if err != nil {
+		return 1, err
 	}
 	worktreeList, err := git.ListWorktrees(ctx, options.Cwd, options.Runner)
 	if err != nil {
 		return 1, err
 	}
-	fmt.Fprint(options.Stdout, renderWorktreeList(worktreeList))
+	prURLs := map[string]string{}
+	if parsed.PullRequests {
+		branches := listBranches(worktreeList)
+		prURLs, err = git.PullRequestURLsByBranch(ctx, worktreeList.CurrentPath, branches, options.Runner)
+		if err != nil {
+			fmt.Fprintf(options.Stderr, "wktree: warning: PR lookup failed: %s\n", err)
+			prURLs = map[string]string{}
+		}
+	}
+	fmt.Fprint(options.Stdout, renderWorktreeList(worktreeList, prURLs, parsed.PullRequests))
 	return 0, nil
 }
 
@@ -299,13 +313,16 @@ func runSwitchPullRequest(ctx context.Context, parsed worktreeArgs, options Opti
 		Value:      parsed.PullRequest,
 		HomeOption: selection.WorktreeHome,
 		Cwd:        selection.Workspaces[0].RepoRoot,
+		Force:      parsed.Force,
 		Runner:     options.Runner,
 	})
 	if err != nil {
 		return 1, fmt.Errorf("%s: %w", selection.Workspaces[0].Name, err)
 	}
-	if err := ensurePullRequestTargetManaged(selection.Workspaces[0], target); err != nil {
-		return 1, fmt.Errorf("%s: %w", selection.Workspaces[0].Name, err)
+	if !parsed.Force {
+		if err := ensurePullRequestTargetManaged(selection.Workspaces[0], target); err != nil {
+			return 1, fmt.Errorf("%s: %w", selection.Workspaces[0].Name, err)
+		}
 	}
 	worktree, err := git.OpenPullRequestWorktree(ctx, target, options.Runner)
 	if err != nil {
@@ -421,6 +438,23 @@ type removeArgs struct {
 	Force      bool
 	DryRun     bool
 	Workspaces bool
+}
+
+type listArgs struct {
+	PullRequests bool
+}
+
+func parseListArgs(args []string) (listArgs, error) {
+	parsed := listArgs{}
+	for _, arg := range args {
+		switch arg {
+		case "--pr":
+			parsed.PullRequests = true
+		default:
+			return listArgs{}, fmt.Errorf("usage: wktree list [--pr]")
+		}
+	}
+	return parsed, nil
 }
 
 func parseRemoveArgs(args []string) (removeArgs, error) {
@@ -991,6 +1025,7 @@ func sessionName(selection workspaceSelection, branch string) string {
 
 type worktreeArgs struct {
 	Branch      string
+	Force       bool
 	From        string
 	Home        string
 	PullRequest string
@@ -1003,6 +1038,11 @@ func parseWorktreeArgs(command string, args []string) (worktreeArgs, error) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
+		case arg == "--force" || arg == "-f":
+			if command != "switch" {
+				return worktreeArgs{}, fmt.Errorf("unknown option: %s", arg)
+			}
+			parsed.Force = true
 		case arg == "--workspaces":
 			parsed.Workspaces = true
 		case arg == "--pr":
@@ -1064,6 +1104,9 @@ func parseWorktreeArgs(command string, args []string) (worktreeArgs, error) {
 		}
 		return parsed, nil
 	}
+	if parsed.Force {
+		return worktreeArgs{}, fmt.Errorf("--force can only be used with --pr")
+	}
 	if len(positionals) != 1 {
 		return worktreeArgs{}, fmt.Errorf("%s", usageFor(command))
 	}
@@ -1076,7 +1119,7 @@ func usageFor(command string) string {
 		return "usage: wktree new [--home <path>] [--from <ref>] [--workspaces] <branch>"
 	}
 	if command == "switch" {
-		return "usage: wktree switch [--home <path>] [--workspaces] <branch> | wktree switch [--home <path>] --pr <number|url>"
+		return "usage: wktree switch [--home <path>] [--workspaces] <branch> | wktree switch [--home <path>] [--force] --pr <number|url>"
 	}
 	return fmt.Sprintf("usage: wktree %s [--home <path>] [--workspaces] <branch>", command)
 }
@@ -1115,17 +1158,29 @@ type listRow struct {
 	current string
 	branch  string
 	head    string
+	pr      string
 	path    string
 }
 
-func renderWorktreeList(worktreeList git.WorktreeList) string {
+func renderWorktreeList(worktreeList git.WorktreeList, prURLs map[string]string, includePR bool) string {
 	rows := make([]listRow, 0, len(worktreeList.Worktrees))
 	widths := []int{len("CURRENT"), len("BRANCH"), len("HEAD")}
+	if includePR {
+		widths = append(widths, len("PR"))
+	}
 	for _, worktree := range worktreeList.Worktrees {
 		row := listRow{
 			branch: displayBranch(worktree),
 			head:   shortHead(worktree.Head),
 			path:   worktree.Path,
+		}
+		if includePR {
+			row.pr = "-"
+			if !worktree.Detached && worktree.Branch != "" {
+				if url := strings.TrimSpace(prURLs[worktree.Branch]); url != "" {
+					row.pr = url
+				}
+			}
 		}
 		if samePath(worktreeList.CurrentPath, worktree.Path) {
 			row.current = "*"
@@ -1133,15 +1188,39 @@ func renderWorktreeList(worktreeList git.WorktreeList) string {
 		widths[0] = max(widths[0], len(row.current))
 		widths[1] = max(widths[1], len(row.branch))
 		widths[2] = max(widths[2], len(row.head))
+		if includePR {
+			widths[3] = max(widths[3], len(row.pr))
+		}
 		rows = append(rows, row)
 	}
 
 	var output strings.Builder
-	fmt.Fprintf(&output, "%-*s  %-*s  %-*s  %s\n", widths[0], "CURRENT", widths[1], "BRANCH", widths[2], "HEAD", "PATH")
+	if includePR {
+		fmt.Fprintf(&output, "%-*s  %-*s  %-*s  %-*s  %s\n", widths[0], "CURRENT", widths[1], "BRANCH", widths[2], "HEAD", widths[3], "PR", "PATH")
+	} else {
+		fmt.Fprintf(&output, "%-*s  %-*s  %-*s  %s\n", widths[0], "CURRENT", widths[1], "BRANCH", widths[2], "HEAD", "PATH")
+	}
 	for _, row := range rows {
-		fmt.Fprintf(&output, "%-*s  %-*s  %-*s  %s\n", widths[0], row.current, widths[1], row.branch, widths[2], row.head, row.path)
+		if includePR {
+			fmt.Fprintf(&output, "%-*s  %-*s  %-*s  %-*s  %s\n", widths[0], row.current, widths[1], row.branch, widths[2], row.head, widths[3], row.pr, row.path)
+		} else {
+			fmt.Fprintf(&output, "%-*s  %-*s  %-*s  %s\n", widths[0], row.current, widths[1], row.branch, widths[2], row.head, row.path)
+		}
 	}
 	return output.String()
+}
+
+func listBranches(worktreeList git.WorktreeList) []string {
+	branches := []string{}
+	seen := map[string]bool{}
+	for _, worktree := range worktreeList.Worktrees {
+		if worktree.Detached || worktree.Branch == "" || seen[worktree.Branch] {
+			continue
+		}
+		seen[worktree.Branch] = true
+		branches = append(branches, worktree.Branch)
+	}
+	return branches
 }
 
 func displayBranch(worktree git.ListedWorktree) string {
@@ -1210,12 +1289,12 @@ Usage:
   wktree --version
   wktree init
   wktree doctor
-  wktree list
+  wktree list [--pr]
   wktree new [--home <path>] [--from <ref>] [--workspaces] <branch>
   wktree close [--dry-run] [--workspaces] <branch>
   wktree remove [--force] [--dry-run] [--workspaces] <branch>
   wktree switch [--home <path>] [--workspaces] <branch>
-  wktree switch [--home <path>] --pr <number|url>
+  wktree switch [--home <path>] [--force] --pr <number|url>
   wktree completion zsh
   wktree completion bash
 
@@ -1223,10 +1302,12 @@ Examples:
   wktree init
   wktree doctor
   wktree list
+  wktree list --pr
   wktree new feature/example
   wktree new --from main feature/example
   wktree new --workspaces feature/example
   wktree switch --pr 123
+  wktree switch --force --pr 123
   wktree close --workspaces feature/example
   wktree remove --dry-run --workspaces feature/example
   wktree switch --workspaces feature/example

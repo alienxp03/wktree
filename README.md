@@ -33,11 +33,13 @@ make install INSTALL_DIR="$HOME/bin"
 wktree init
 wktree doctor
 wktree list
+wktree list --pr
 wktree new feature/example
 wktree new --from main feature/example
 wktree new --workspaces feature/example
 wktree switch feature/example
 wktree switch --pr 123
+wktree switch --force --pr 123
 wktree switch --workspaces feature/example
 wktree close feature/example
 wktree close --dry-run --workspaces feature/example
@@ -52,13 +54,13 @@ wktree remove --force --workspaces feature/example
 
 `wktree switch <branch>` opens an existing branch worktree. If the branch exists but has no worktree yet, it creates one. If only `origin/<branch>` exists, it creates a local tracking branch and worktree.
 
-`wktree switch --pr <number-or-url>` opens a GitHub pull request for the current repo only. It requires the GitHub CLI, fetches the PR head from `origin`, uses the PR contributor branch name for the local branch and worktree, and ignores workspace fan-out even when `workspace_mode: all` is configured.
+`wktree switch --pr <number-or-url>` opens a GitHub pull request for the current repo only. It requires the GitHub CLI, fetches the PR head from `origin`, uses the PR contributor branch name for the local branch and worktree, and ignores workspace fan-out even when `workspace_mode: all` is configured. If the PR branch already exists locally but is not managed as a PR worktree, use `--force` to check out that branch into the PR worktree path and hard-reset it to the fetched PR head.
 
 `wktree close <branch>` closes the matching tmux window or session target without deleting the worktree, local branch, or generated `.wktree.env`. Use `--dry-run` to preview the tmux action. If `.wktree.env` shows that the branch was opened with multiple workspaces, single-workspace close stops and asks for `--workspaces`.
 
 `wktree remove <branch>` kills the matching tmux window or session target, removes the branch worktree, and deletes the local branch with Git's safe deletion rules. It prints progress before each remove step so slow Git or tmux operations show where they are. It does not remove remote branches. Use `--dry-run` to preview the tmux and Git actions. Use `--force` to remove a dirty worktree and force-delete the local branch. If `.wktree.env` shows that the branch was opened with multiple workspaces, single-workspace remove stops and asks for `--workspaces`.
 
-`wktree list` shows every Git worktree for the current repository, including the primary checkout.
+`wktree list` shows every Git worktree for the current repository, including the primary checkout. Use `wktree list --pr` to add a PR column for open GitHub PRs matching local branch names. PR lookup requires the GitHub CLI and is best-effort, so list still succeeds if lookup fails.
 
 By default, worktrees are created under:
 
@@ -304,7 +306,7 @@ Completion includes commands, flags, existing local and `origin` branches for `s
 - `origin branch already exists`: fetches or remote refs already include that branch.
 - `branch does not exist locally or on origin`: use `wktree new <branch>` to create a new branch.
 - `gh is required for --pr`: install and authenticate the GitHub CLI, then rerun `wktree switch --pr <number-or-url>`.
-- `local branch already exists but is not managed for PR`: rename or delete the unrelated local branch, or open the PR with a different branch name upstream.
+- `local branch already exists but is not managed for PR`: rename or delete the unrelated local branch, open the PR with a different branch name upstream, or rerun `wktree switch --force --pr <number-or-url>` to reset the local branch to the PR head.
 - `branch is not merged into current HEAD`: merge the branch or use `wktree remove --force <branch>` if you really want to delete it.
 - `target worktree path already exists`: remove or rename the existing directory, or use `--home`.
 - `tmux ... failed`: install tmux or choose names that produce non-conflicting tmux targets.

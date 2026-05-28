@@ -18,6 +18,7 @@ type PullRequestOptions struct {
 	Value      string
 	HomeOption string
 	Cwd        string
+	Force      bool
 	Runner     run.Runner
 }
 
@@ -41,6 +42,50 @@ type pullRequestView struct {
 	HeadRefName string `json:"headRefName"`
 	HeadRefOID  string `json:"headRefOid"`
 	URL         string `json:"url"`
+}
+
+type pullRequestListItem struct {
+	HeadRefName string `json:"headRefName"`
+	URL         string `json:"url"`
+}
+
+func PullRequestURLsByBranch(ctx context.Context, repoRoot string, branches []string, runner run.Runner) (map[string]string, error) {
+	if runner == nil {
+		runner = run.DefaultRunner{}
+	}
+	wanted := map[string]bool{}
+	for _, branch := range branches {
+		branch = strings.TrimSpace(branch)
+		if branch != "" {
+			wanted[branch] = true
+		}
+	}
+	if len(wanted) == 0 {
+		return map[string]string{}, nil
+	}
+
+	args := []string{"pr", "list", "--state", "open", "--limit", "100", "--json", "headRefName,url"}
+	result := runner.Run(ctx, "gh", args, run.Options{Cwd: repoRoot})
+	if result.Err != nil || result.ExitCode != 0 {
+		return nil, fmt.Errorf("gh is required for PR lookup: %s", run.FailureMessage("gh", args, result))
+	}
+
+	var items []pullRequestListItem
+	if err := json.Unmarshal([]byte(result.Stdout), &items); err != nil {
+		return nil, fmt.Errorf("failed to parse gh pr list output: %w", err)
+	}
+	urls := map[string]string{}
+	for _, item := range items {
+		branch := strings.TrimSpace(item.HeadRefName)
+		url := strings.TrimSpace(item.URL)
+		if branch == "" || url == "" || !wanted[branch] {
+			continue
+		}
+		if _, exists := urls[branch]; !exists {
+			urls[branch] = url
+		}
+	}
+	return urls, nil
 }
 
 func ResolvePullRequestWorktree(ctx context.Context, options PullRequestOptions) (PullRequestTarget, error) {
@@ -89,11 +134,15 @@ func ResolvePullRequestWorktree(ctx context.Context, options PullRequestOptions)
 	if err != nil {
 		return PullRequestTarget{}, err
 	}
-	if !ok {
-		return PullRequestTarget{}, fmt.Errorf("local branch already exists but is not checked out by a wktree PR worktree: %s", pr.HeadRefName)
+	if !ok && !options.Force {
+		return PullRequestTarget{}, fmt.Errorf("local branch already exists but is not checked out by a wktree PR worktree, use --force to reset it: %s", pr.HeadRefName)
 	}
-	worktree.Reused = true
-	worktree.WorktreePath = worktreePath
+	if ok {
+		worktree.Reused = true
+		worktree.WorktreePath = worktreePath
+	} else if err := ensureTargetPathAvailable(worktree.WorktreePath); err != nil {
+		return PullRequestTarget{}, err
+	}
 	target.Worktree = worktree
 	target.BranchExists = true
 	return target, nil
@@ -176,9 +225,17 @@ func OpenPullRequestWorktree(ctx context.Context, target PullRequestTarget, runn
 	}
 
 	args := []string{"worktree", "add", "-b", target.Worktree.Branch, target.Worktree.WorktreePath, target.FetchRef}
+	if target.BranchExists {
+		args = []string{"worktree", "add", target.Worktree.WorktreePath, target.Worktree.Branch}
+	}
 	result := runGit(ctx, runner, target.Worktree.RepoRoot, args, false)
 	if result.Err != nil || result.ExitCode != 0 {
 		return Worktree{}, errors.New(run.FailureMessage("git", args, result))
+	}
+	if target.BranchExists {
+		if err := resetWorktree(ctx, target.Worktree.WorktreePath, target.FetchRef, runner); err != nil {
+			return Worktree{}, err
+		}
 	}
 	return target.Worktree, nil
 }

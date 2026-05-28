@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/alienxp03/wktree/internal/config"
+	"github.com/alienxp03/wktree/internal/git"
 	"github.com/alienxp03/wktree/internal/tmux"
 )
 
@@ -44,6 +45,12 @@ func TestCompletion(t *testing.T) {
 	if !strings.Contains(stdout.String(), "complete -F _wktree_completion wktree") {
 		t.Fatalf("legacy init = %q", stdout.String())
 	}
+
+	stdout.Reset()
+	status = Run([]string{"__complete", "list", "--"}, Options{Stdout: stdout, Stderr: &bytes.Buffer{}})
+	if status != 0 || !strings.Contains(stdout.String(), "--pr") {
+		t.Fatalf("list completion status=%d stdout=%q", status, stdout.String())
+	}
 }
 
 func TestInvalidNewUsage(t *testing.T) {
@@ -65,6 +72,19 @@ func TestInvalidListUsage(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "usage: wktree list") {
 		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestParseListArgs(t *testing.T) {
+	parsed, err := parseListArgs([]string{"--pr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !parsed.PullRequests {
+		t.Fatalf("parsed = %+v", parsed)
+	}
+	if _, err := parseListArgs([]string{"--bad"}); err == nil || !strings.Contains(err.Error(), "usage: wktree list") {
+		t.Fatalf("expected usage error, got %v", err)
 	}
 }
 
@@ -121,12 +141,12 @@ func TestParseSwitchPullRequestArgs(t *testing.T) {
 		t.Fatalf("parsed = %+v", parsed)
 	}
 
-	parsed, err = parseWorktreeArgs("switch", []string{"--pr=https://github.com/alienxp03/demo/pull/123"})
+	parsed, err = parseWorktreeArgs("switch", []string{"--force", "--pr=https://github.com/alienxp03/demo/pull/123"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.PullRequest != "https://github.com/alienxp03/demo/pull/123" {
-		t.Fatalf("parsed PR = %q", parsed.PullRequest)
+	if parsed.PullRequest != "https://github.com/alienxp03/demo/pull/123" || !parsed.Force {
+		t.Fatalf("parsed = %+v", parsed)
 	}
 }
 
@@ -139,6 +159,9 @@ func TestParseSwitchPullRequestRejectsBranchAndWorkspaces(t *testing.T) {
 	}
 	if _, err := parseWorktreeArgs("new", []string{"--pr", "123"}); err == nil || !strings.Contains(err.Error(), "unknown option: --pr") {
 		t.Fatalf("expected new --pr error, got %v", err)
+	}
+	if _, err := parseWorktreeArgs("switch", []string{"--force", "feature/example"}); err == nil || !strings.Contains(err.Error(), "--force can only be used with --pr") {
+		t.Fatalf("expected --force without --pr error, got %v", err)
 	}
 }
 
@@ -163,5 +186,28 @@ func TestEffectiveTmuxModeForcesSessionForAllWorkspaces(t *testing.T) {
 	selection.AllWorkspaces = false
 	if got := effectiveTmuxMode(selection); got != tmux.ModeWindow {
 		t.Fatalf("single workspace effective tmux mode = %q", got)
+	}
+}
+
+func TestRenderWorktreeListWithPullRequests(t *testing.T) {
+	worktrees := git.WorktreeList{
+		CurrentPath: "/repo",
+		Worktrees: []git.ListedWorktree{
+			{Path: "/repo", Head: "123456789", Branch: "main"},
+			{Path: "/worktrees/feature", Head: "abcdef123", Branch: "feature/pr"},
+			{Path: "/worktrees/detached", Head: "deadbeef", Detached: true},
+		},
+	}
+
+	withoutPR := renderWorktreeList(worktrees, nil, false)
+	if strings.Contains(withoutPR, "PR") || strings.Contains(withoutPR, "https://github.com/alienxp03/demo/pull/123") {
+		t.Fatalf("default list should not include PR column:\n%s", withoutPR)
+	}
+
+	withPR := renderWorktreeList(worktrees, map[string]string{"feature/pr": "https://github.com/alienxp03/demo/pull/123"}, true)
+	for _, want := range []string{"CURRENT", "BRANCH", "HEAD", "PR", "PATH", "https://github.com/alienxp03/demo/pull/123", "(detached)"} {
+		if !strings.Contains(withPR, want) {
+			t.Fatalf("PR list output missing %q:\n%s", want, withPR)
+		}
 	}
 }
