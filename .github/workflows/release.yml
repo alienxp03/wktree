@@ -115,60 +115,45 @@ jobs:
           SHA_LINUX_AMD64: ${{ steps.shas.outputs.linux_amd64 }}
         run: |
           mkdir -p tap/Formula
-          python3 -c "
-          import os
-          v = os.environ['VERSION']
-          sha = {
-              'darwin_arm64': os.environ['SHA_DARWIN_ARM64'],
-              'darwin_amd64': os.environ['SHA_DARWIN_AMD64'],
-              'linux_arm64': os.environ['SHA_LINUX_ARM64'],
-              'linux_amd64': os.environ['SHA_LINUX_AMD64'],
-          }
-          formula = '''class Wktree < Formula
-            desc \"Create strict Git worktrees and open tmux workspaces\"
-            homepage \"https://github.com/alienxp03/wktree\"
-            version \"{v}\"
+          cat > tap/Formula/wktree.rb <<FORMULA
+          class Wktree < Formula
+            desc "Create strict Git worktrees and open tmux workspaces"
+            homepage "https://github.com/alienxp03/wktree"
+            version "${VERSION}"
 
             on_macos do
               on_arm do
-                url \"https://github.com/alienxp03/wktree/releases/download/{v}/wktree-{v}-darwin-arm64.tar.gz\"
-                sha256 \"\"\"{da64}\"\"\"
+                url "https://github.com/alienxp03/wktree/releases/download/${VERSION}/wktree-${VERSION}-darwin-arm64.tar.gz"
+                sha256 "${SHA_DARWIN_ARM64}"
               end
               on_intel do
-                url \"https://github.com/alienxp03/wktree/releases/download/{v}/wktree-{v}-darwin-amd64.tar.gz\"
-                sha256 \"\"\"{dx64}\"\"\"
+                url "https://github.com/alienxp03/wktree/releases/download/${VERSION}/wktree-${VERSION}-darwin-amd64.tar.gz"
+                sha256 "${SHA_DARWIN_AMD64}"
               end
             end
 
             on_linux do
               on_arm do
-                url \"https://github.com/alienxp03/wktree/releases/download/{v}/wktree-{v}-linux-arm64.tar.gz\"
-                sha256 \"\"\"{la64}\"\"\"
+                url "https://github.com/alienxp03/wktree/releases/download/${VERSION}/wktree-${VERSION}-linux-arm64.tar.gz"
+                sha256 "${SHA_LINUX_ARM64}"
               end
               on_intel do
-                url \"https://github.com/alienxp03/wktree/releases/download/{v}/wktree-{v}-linux-amd64.tar.gz\"
-                sha256 \"\"\"{lx64}\"\"\"
+                url "https://github.com/alienxp03/wktree/releases/download/${VERSION}/wktree-${VERSION}-linux-amd64.tar.gz"
+                sha256 "${SHA_LINUX_AMD64}"
               end
             end
 
             def install
-              bin.install \"wktree\"
+              bin.install "wktree"
             end
 
             test do
-              assert_match version.to_s, shell_output(\"\#{bin}/wktree --version\")
+              assert_match version.to_s, shell_output("#{bin}/wktree --version")
             end
           end
-          '''.format(
-              v=v,
-              da64=sha['darwin_arm64'],
-              dx64=sha['darwin_amd64'],
-              la64=sha['linux_arm64'],
-              lx64=sha['linux_amd64'],
-          )
-          with open('tap/Formula/wktree.rb', 'w') as f:
-              f.write(formula)
-          "
+          FORMULA
+          # Remove leading whitespace added by the heredoc indent
+          sed -i 's/^          //' tap/Formula/wktree.rb
 
       - name: Commit and push formula
         working-directory: tap
