@@ -10,9 +10,11 @@ GOFMT ?= gofmt
 
 all: build
 
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
 build:
 	mkdir -p "$(DIST_DIR)"
-	$(GO) build -trimpath -o "$(BUILD_PATH)" "$(CMD)"
+	$(GO) build -trimpath -ldflags="-X github.com/alienxp03/wktree/internal/cli.Version=$(VERSION)" -o "$(BUILD_PATH)" "$(CMD)"
 
 install: build
 	mkdir -p "$(INSTALL_DIR)"

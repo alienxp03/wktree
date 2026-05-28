@@ -18,7 +18,7 @@ import (
 	"github.com/alienxp03/wktree/internal/tmux"
 )
 
-const Version = "0.1.0"
+var Version = "0.1.0" // overridden via -ldflags at build time
 
 type Options struct {
 	Cwd         string

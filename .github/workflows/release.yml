@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags="-s -w -X github.com/alienxp03/wktree/internal/cli.Version=${{ github.ref_name }}" \
+            -o dist/wktree ./cmd/wktree
+
+      - name: Package
+        run: |
+          cd dist
+          ARCHIVE=wktree-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          tar czf "$ARCHIVE" wktree
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wktree-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/wktree-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
+
+  update-tap:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute SHA256s
+        id: shas
+        run: |
+          echo "darwin_arm64=$(sha256sum dist/wktree-${{ github.ref_name }}-darwin-arm64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "darwin_amd64=$(sha256sum dist/wktree-${{ github.ref_name }}-darwin-amd64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=$(sha256sum dist/wktree-${{ github.ref_name }}-linux-arm64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_amd64=$(sha256sum dist/wktree-${{ github.ref_name }}-linux-amd64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: alienxp03/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+
+      - name: Generate formula
+        env:
+          VERSION: ${{ github.ref_name }}
+          SHA_DARWIN_ARM64: ${{ steps.shas.outputs.darwin_arm64 }}
+          SHA_DARWIN_AMD64: ${{ steps.shas.outputs.darwin_amd64 }}
+          SHA_LINUX_ARM64: ${{ steps.shas.outputs.linux_arm64 }}
+          SHA_LINUX_AMD64: ${{ steps.shas.outputs.linux_amd64 }}
+        run: |
+          mkdir -p tap/Formula
+          python3 -c "
+          import os
+          v = os.environ['VERSION']
+          sha = {
+              'darwin_arm64': os.environ['SHA_DARWIN_ARM64'],
+              'darwin_amd64': os.environ['SHA_DARWIN_AMD64'],
+              'linux_arm64': os.environ['SHA_LINUX_ARM64'],
+              'linux_amd64': os.environ['SHA_LINUX_AMD64'],
+          }
+          formula = '''class Wktree < Formula
+            desc \"Create strict Git worktrees and open tmux workspaces\"
+            homepage \"https://github.com/alienxp03/wktree\"
+            version \"{v}\"
+
+            on_macos do
+              on_arm do
+                url \"https://github.com/alienxp03/wktree/releases/download/{v}/wktree-{v}-darwin-arm64.tar.gz\"
+                sha256 \"\"\"{da64}\"\"\"
+              end
+              on_intel do
+                url \"https://github.com/alienxp03/wktree/releases/download/{v}/wktree-{v}-darwin-amd64.tar.gz\"
+                sha256 \"\"\"{dx64}\"\"\"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url \"https://github.com/alienxp03/wktree/releases/download/{v}/wktree-{v}-linux-arm64.tar.gz\"
+                sha256 \"\"\"{la64}\"\"\"
+              end
+              on_intel do
+                url \"https://github.com/alienxp03/wktree/releases/download/{v}/wktree-{v}-linux-amd64.tar.gz\"
+                sha256 \"\"\"{lx64}\"\"\"
+              end
+            end
+
+            def install
+              bin.install \"wktree\"
+            end
+
+            test do
+              assert_match version.to_s, shell_output(\"\#{bin}/wktree --version\")
+            end
+          end
+          '''.format(
+              v=v,
+              da64=sha['darwin_arm64'],
+              dx64=sha['darwin_amd64'],
+              la64=sha['linux_arm64'],
+              lx64=sha['linux_amd64'],
+          )
+          with open('tap/Formula/wktree.rb', 'w') as f:
+              f.write(formula)
+          "
+
+      - name: Commit and push formula
+        working-directory: tap
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/wktree.rb
+          git diff --cached --quiet || git commit -m "wktree ${VERSION}"
+          git push

@@ -4,6 +4,15 @@ Create strict Git worktrees from the current `HEAD` or another ref, then open a 
 
 ## Install
 
+### Homebrew (recommended)
+
+```bash
+brew tap alienxp03/tap
+brew install wktree
+```
+
+### Go
+
 ```bash
 go install github.com/alienxp03/wktree/cmd/wktree@latest
 ```
