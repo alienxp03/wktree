@@ -164,6 +164,8 @@ wktree doctor                     Check repo, config, and tmux setup
 
 wktree list                       List worktrees
 wktree list --pr                  List worktrees with PR info
+wktree cleanup                    Remove merged worktree branches after confirmation
+wktree cleanup --dry-run          Preview merged worktree branch cleanup
 
 wktree new <branch>               Create branch + worktree + tmux
 wktree new --from <ref> <branch>  Create from a specific ref
@@ -177,6 +179,7 @@ wktree remove <branch>            Close tmux + remove worktree + delete branch
 ```
 
 Common flags: `--dry-run` to preview, `--force` to override safety checks, `--workspaces` to target all workspaces.
+Use `wktree cleanup --yes` to skip the confirmation prompt after reviewing the cleanup behavior.
 
 Worktree paths follow `<worktree_dir>/<owner>/<repo>/<branch>`. For GitHub remotes, `owner` and `repo` come from the remote URL.
 

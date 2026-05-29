@@ -75,6 +75,17 @@ func TestInvalidListUsage(t *testing.T) {
 	}
 }
 
+func TestInvalidCleanupUsage(t *testing.T) {
+	stderr := &bytes.Buffer{}
+	status := Run([]string{"cleanup", "--bad"}, Options{Stdout: &bytes.Buffer{}, Stderr: stderr})
+	if status != 1 {
+		t.Fatalf("status = %d", status)
+	}
+	if !strings.Contains(stderr.String(), "usage: wktree cleanup") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
 func TestParseListArgs(t *testing.T) {
 	parsed, err := parseListArgs([]string{"--pr"})
 	if err != nil {
@@ -84,6 +95,19 @@ func TestParseListArgs(t *testing.T) {
 		t.Fatalf("parsed = %+v", parsed)
 	}
 	if _, err := parseListArgs([]string{"--bad"}); err == nil || !strings.Contains(err.Error(), "usage: wktree list") {
+		t.Fatalf("expected usage error, got %v", err)
+	}
+}
+
+func TestParseCleanupArgs(t *testing.T) {
+	parsed, err := parseCleanupArgs([]string{"--dry-run", "--yes", "--workspaces"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !parsed.DryRun || !parsed.Yes || !parsed.Workspaces {
+		t.Fatalf("parsed = %+v", parsed)
+	}
+	if _, err := parseCleanupArgs([]string{"extra"}); err == nil || !strings.Contains(err.Error(), "usage: wktree cleanup") {
 		t.Fatalf("expected usage error, got %v", err)
 	}
 }
@@ -209,5 +233,27 @@ func TestRenderWorktreeListWithPullRequests(t *testing.T) {
 		if !strings.Contains(withPR, want) {
 			t.Fatalf("PR list output missing %q:\n%s", want, withPR)
 		}
+	}
+}
+
+func TestConfirmCleanupRequiresYes(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	confirmed, err := confirmCleanup(strings.NewReader("no\n"), stdout, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed {
+		t.Fatal("expected no to cancel cleanup")
+	}
+	if !strings.Contains(stdout.String(), "Type 'yes'") {
+		t.Fatalf("prompt = %q", stdout.String())
+	}
+
+	confirmed, err = confirmCleanup(strings.NewReader("yes\n"), &bytes.Buffer{}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !confirmed {
+		t.Fatal("expected yes to confirm cleanup")
 	}
 }

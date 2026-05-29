@@ -46,6 +46,7 @@ type RemoveTarget struct {
 	Branch       string
 	RepoRoot     string
 	WorktreePath string
+	ForceDelete  bool
 }
 
 type CreateOptions struct {
@@ -146,8 +147,8 @@ func CompleteRemoveBranches(ctx context.Context, cwd string, prefix string, runn
 		return nil, err
 	}
 	names := []string{}
-	for _, worktree := range worktrees {
-		if worktree.Detached || worktree.Branch == "" || samePath(repoRoot, worktree.Path) {
+	for index, worktree := range worktrees {
+		if index == 0 || worktree.Detached || worktree.Branch == "" || samePath(repoRoot, worktree.Path) {
 			continue
 		}
 		names = append(names, worktree.Branch)
@@ -366,12 +367,18 @@ func ResolveRemoveTarget(ctx context.Context, options RemoveOptions) (RemoveTarg
 	if samePath(repoRoot, worktreePath) {
 		return RemoveTarget{}, fmt.Errorf("cannot remove current worktree: %s", branch)
 	}
+	target := RemoveTarget{Branch: branch, RepoRoot: repoRoot, WorktreePath: worktreePath}
 	if !options.Force {
-		if err := ensureBranchMerged(ctx, repoRoot, branch, runner); err != nil {
+		status, err := branchRemovalStatus(ctx, repoRoot, branch, runner)
+		if err != nil {
 			return RemoveTarget{}, err
 		}
+		if !status.Merged {
+			return RemoveTarget{}, fmt.Errorf("branch is not merged into current HEAD: %s", branch)
+		}
+		target.ForceDelete = status.ForceDelete
 	}
-	return RemoveTarget{Branch: branch, RepoRoot: repoRoot, WorktreePath: worktreePath}, nil
+	return target, nil
 }
 
 func ResolveCloseTarget(ctx context.Context, options RemoveOptions) (RemoveTarget, error) {
@@ -407,6 +414,36 @@ func ResolveCloseTarget(ctx context.Context, options RemoveOptions) (RemoveTarge
 	return RemoveTarget{Branch: branch, RepoRoot: repoRoot, WorktreePath: worktreePath}, nil
 }
 
+func ResolveCleanupTargets(ctx context.Context, cwd string, runner run.Runner) ([]RemoveTarget, error) {
+	if runner == nil {
+		runner = run.DefaultRunner{}
+	}
+	repoRoot, err := RepoRoot(ctx, cwd, runner)
+	if err != nil {
+		return nil, err
+	}
+	worktrees, err := listWorktrees(ctx, repoRoot, runner)
+	if err != nil {
+		return nil, err
+	}
+	targets := []RemoveTarget{}
+	for index, worktree := range worktrees {
+		// Git lists the primary worktree first; never delete it during cleanup.
+		if index == 0 || worktree.Detached || worktree.Branch == "" || samePath(repoRoot, worktree.Path) {
+			continue
+		}
+		status, err := branchRemovalStatus(ctx, repoRoot, worktree.Branch, runner)
+		if err != nil {
+			return nil, err
+		}
+		if !status.Merged {
+			continue
+		}
+		targets = append(targets, RemoveTarget{Branch: worktree.Branch, RepoRoot: repoRoot, WorktreePath: worktree.Path, ForceDelete: status.ForceDelete})
+	}
+	return targets, nil
+}
+
 func RemoveWorktree(ctx context.Context, target RemoveTarget, force bool, runner run.Runner) error {
 	if err := RemoveWorktreePath(ctx, target, force, runner); err != nil {
 		return err
@@ -435,7 +472,7 @@ func DeleteBranch(ctx context.Context, target RemoveTarget, force bool, runner r
 		runner = run.DefaultRunner{}
 	}
 	deleteArgs := []string{"branch", "-d"}
-	if force {
+	if force || target.ForceDelete {
 		deleteArgs = []string{"branch", "-D"}
 	}
 	deleteArgs = append(deleteArgs, target.Branch)
@@ -571,6 +608,15 @@ func branchNames(ctx context.Context, repoRoot string, runner run.Runner) ([]str
 	return uniqueSorted(names), nil
 }
 
+func branchOID(ctx context.Context, repoRoot string, branch string, runner run.Runner) (string, error) {
+	args := []string{"rev-parse", "--verify", branch + "^{commit}"}
+	result := runGit(ctx, runner, repoRoot, args, false)
+	if result.Err != nil || result.ExitCode != 0 {
+		return "", errors.New(run.FailureMessage("git", args, result))
+	}
+	return strings.TrimSpace(result.Stdout), nil
+}
+
 func filterPrefix(values []string, prefix string) []string {
 	filtered := []string{}
 	for _, value := range values {
@@ -595,15 +641,53 @@ func uniqueSorted(values []string) []string {
 }
 
 func ensureBranchMerged(ctx context.Context, repoRoot string, branch string, runner run.Runner) error {
-	args := []string{"merge-base", "--is-ancestor", branch, "HEAD"}
+	status, err := branchRemovalStatus(ctx, repoRoot, branch, runner)
+	if err != nil {
+		return err
+	}
+	if !status.Merged {
+		return fmt.Errorf("branch is not merged into current HEAD: %s", branch)
+	}
+	return nil
+}
+
+type branchRemovalMergeStatus struct {
+	Merged      bool
+	ForceDelete bool
+}
+
+func branchRemovalStatus(ctx context.Context, repoRoot string, branch string, runner run.Runner) (branchRemovalMergeStatus, error) {
+	merged, err := BranchMerged(ctx, repoRoot, branch, runner)
+	if err != nil {
+		return branchRemovalMergeStatus{}, err
+	}
+	if merged {
+		return branchRemovalMergeStatus{Merged: true}, nil
+	}
+	mergedPR, err := PullRequestMergedForBranch(ctx, repoRoot, branch, runner)
+	if err != nil {
+		return branchRemovalMergeStatus{}, nil
+	}
+	if mergedPR {
+		return branchRemovalMergeStatus{Merged: true, ForceDelete: true}, nil
+	}
+	return branchRemovalMergeStatus{}, nil
+}
+
+func BranchMerged(ctx context.Context, repoRoot string, branch string, runner run.Runner) (bool, error) {
+	return commitMerged(ctx, repoRoot, branch, "HEAD", runner)
+}
+
+func commitMerged(ctx context.Context, repoRoot string, ancestor string, descendant string, runner run.Runner) (bool, error) {
+	args := []string{"merge-base", "--is-ancestor", ancestor, descendant}
 	result := runGit(ctx, runner, repoRoot, args, true)
 	switch result.ExitCode {
 	case 0:
-		return nil
+		return true, nil
 	case 1:
-		return fmt.Errorf("branch is not merged into current HEAD: %s", branch)
+		return false, nil
 	default:
-		return errors.New(run.FailureMessage("git", args, result))
+		return false, errors.New(run.FailureMessage("git", args, result))
 	}
 }
 

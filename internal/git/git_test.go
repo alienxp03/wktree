@@ -91,6 +91,51 @@ func TestPullRequestURLsByBranch(t *testing.T) {
 	}
 }
 
+func TestPullRequestMergedForBranchRequiresMatchingHeadAndMergeInHEAD(t *testing.T) {
+	got, err := PullRequestMergedForBranch(context.Background(), "/repo", "feature/squash", run.RunnerFunc(func(_ context.Context, command string, args []string, options run.Options) run.Result {
+		if options.Cwd != "/repo" {
+			t.Fatalf("cwd = %q", options.Cwd)
+		}
+		switch command + " " + strings.Join(args, " ") {
+		case "git rev-parse --verify feature/squash^{commit}":
+			return run.Result{Stdout: "abc123\n"}
+		case "gh pr list --head feature/squash --state merged --limit 20 --json headRefName,headRefOid,mergeCommit":
+			return run.Result{Stdout: `[{"headRefName":"feature/squash","headRefOid":"abc123","mergeCommit":{"oid":"def456"}}]`}
+		case "git merge-base --is-ancestor def456 HEAD":
+			return run.Result{ExitCode: 0}
+		default:
+			t.Fatalf("unexpected command: %s %v", command, args)
+			return run.Result{ExitCode: 1}
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got {
+		t.Fatal("expected merged PR to be accepted")
+	}
+}
+
+func TestPullRequestMergedForBranchRejectsChangedHead(t *testing.T) {
+	got, err := PullRequestMergedForBranch(context.Background(), "/repo", "feature/squash", run.RunnerFunc(func(_ context.Context, command string, args []string, _ run.Options) run.Result {
+		switch command + " " + strings.Join(args, " ") {
+		case "git rev-parse --verify feature/squash^{commit}":
+			return run.Result{Stdout: "abc123\n"}
+		case "gh pr list --head feature/squash --state merged --limit 20 --json headRefName,headRefOid,mergeCommit":
+			return run.Result{Stdout: `[{"headRefName":"feature/squash","headRefOid":"changed","mergeCommit":{"oid":"def456"}}]`}
+		default:
+			t.Fatalf("unexpected command: %s %v", command, args)
+			return run.Result{ExitCode: 1}
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got {
+		t.Fatal("expected changed PR head to be rejected")
+	}
+}
+
 func TestGeneratedStatusLineMatchesNestedContextEnv(t *testing.T) {
 	for _, line := range []string{"?? .wktree.env", "?? projects/project_a/.wktree.env", " M apps/app_a/.wktree.env"} {
 		if !isGeneratedStatusLine(line) {

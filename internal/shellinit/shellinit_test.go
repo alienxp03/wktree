@@ -11,7 +11,7 @@ func TestGenerate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"typeset -f wktree", "WKTREE_CD_FILE", "WKTREE_SETUP_FILE", "unset -f wktree", "compdef _wktree_completion wktree", "command wktree __complete", "doctor list new close remove switch init completion"} {
+	for _, want := range []string{"typeset -f wktree", "WKTREE_CD_FILE", "WKTREE_SETUP_FILE", "unset -f wktree", "compdef _wktree_completion wktree", "command wktree __complete", "doctor list cleanup new close remove switch init completion"} {
 		if !strings.Contains(init, want) {
 			t.Fatalf("init missing %q:\n%s", want, init)
 		}

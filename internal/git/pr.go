@@ -49,6 +49,14 @@ type pullRequestListItem struct {
 	URL         string `json:"url"`
 }
 
+type mergedPullRequestListItem struct {
+	HeadRefName string `json:"headRefName"`
+	HeadRefOID  string `json:"headRefOid"`
+	MergeCommit struct {
+		OID string `json:"oid"`
+	} `json:"mergeCommit"`
+}
+
 func PullRequestURLsByBranch(ctx context.Context, repoRoot string, branches []string, runner run.Runner) (map[string]string, error) {
 	if runner == nil {
 		runner = run.DefaultRunner{}
@@ -86,6 +94,51 @@ func PullRequestURLsByBranch(ctx context.Context, repoRoot string, branches []st
 		}
 	}
 	return urls, nil
+}
+
+func PullRequestMergedForBranch(ctx context.Context, repoRoot string, branch string, runner run.Runner) (bool, error) {
+	if runner == nil {
+		runner = run.DefaultRunner{}
+	}
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return false, nil
+	}
+	headOID, err := branchOID(ctx, repoRoot, branch, runner)
+	if err != nil {
+		return false, err
+	}
+
+	args := []string{"pr", "list", "--head", branch, "--state", "merged", "--limit", "20", "--json", "headRefName,headRefOid,mergeCommit"}
+	result := runner.Run(ctx, "gh", args, run.Options{Cwd: repoRoot})
+	if result.Err != nil || result.ExitCode != 0 {
+		return false, fmt.Errorf("gh is required for merged PR lookup: %s", run.FailureMessage("gh", args, result))
+	}
+
+	var items []mergedPullRequestListItem
+	if err := json.Unmarshal([]byte(result.Stdout), &items); err != nil {
+		return false, fmt.Errorf("failed to parse gh pr list output: %w", err)
+	}
+	for _, item := range items {
+		if strings.TrimSpace(item.HeadRefName) != branch {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(item.HeadRefOID), headOID) {
+			continue
+		}
+		mergeOID := strings.TrimSpace(item.MergeCommit.OID)
+		if mergeOID == "" {
+			continue
+		}
+		merged, err := commitMerged(ctx, repoRoot, mergeOID, "HEAD", runner)
+		if err != nil {
+			return false, err
+		}
+		if merged {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func ResolvePullRequestWorktree(ctx context.Context, options PullRequestOptions) (PullRequestTarget, error) {

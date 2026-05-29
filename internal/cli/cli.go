@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/alienxp03/wktree/internal/config"
@@ -23,6 +25,7 @@ var Version = "0.1.0" // overridden via -ldflags at build time
 type Options struct {
 	Cwd         string
 	Env         map[string]string
+	Stdin       io.Reader
 	Stdout      io.Writer
 	Stderr      io.Writer
 	Runner      run.Runner
@@ -81,6 +84,8 @@ func Run(args []string, options Options) int {
 		exitCode, err = runDoctor(ctx, args[1:], app)
 	case "list":
 		exitCode, err = runList(ctx, args[1:], app)
+	case "cleanup":
+		exitCode, err = runCleanup(ctx, args[1:], app)
 	case "new":
 		exitCode, err = runNew(ctx, args[1:], app)
 	case "close":
@@ -127,6 +132,10 @@ func runComplete(ctx context.Context, args []string, options Options) (int, erro
 		if strings.HasPrefix(prefix, "-") {
 			values = filterPrefix([]string{"--pr"}, prefix)
 		}
+	case "cleanup":
+		if strings.HasPrefix(prefix, "-") {
+			values = filterPrefix([]string{"--dry-run", "--yes", "--workspaces"}, prefix)
+		}
 	case "new":
 		values, err = completeWorktreeCommand(ctx, options, prefix, []string{"--home", "--from", "--workspaces"})
 	case "close":
@@ -144,7 +153,7 @@ func runComplete(ctx context.Context, args []string, options Options) (int, erro
 	case "switch":
 		values, err = completeWorktreeCommand(ctx, options, prefix, []string{"--home", "--workspaces", "--pr", "--force"})
 	default:
-		values = filterPrefix([]string{"doctor", "list", "new", "close", "remove", "switch", "init", "completion"}, prefix)
+		values = filterPrefix([]string{"doctor", "list", "cleanup", "new", "close", "remove", "switch", "init", "completion"}, prefix)
 	}
 	if err != nil {
 		return 1, err
@@ -181,6 +190,79 @@ func runList(ctx context.Context, args []string, options Options) (int, error) {
 		}
 	}
 	fmt.Fprint(options.Stdout, renderWorktreeList(worktreeList, prURLs, parsed.PullRequests))
+	return 0, nil
+}
+
+func runCleanup(ctx context.Context, args []string, options Options) (int, error) {
+	parsed, err := parseCleanupArgs(args)
+	if err != nil {
+		return 1, err
+	}
+	selection, err := resolveWorkspaceSelection(ctx, options, "", parsed.Workspaces)
+	if err != nil {
+		return 1, err
+	}
+	candidates, err := resolveCleanupCandidates(ctx, selection, options)
+	if err != nil {
+		return 1, err
+	}
+	if len(candidates) == 0 {
+		fmt.Fprintln(options.Stdout, "cleanup: no merged worktree branches found")
+		return 0, nil
+	}
+	if !selection.AllWorkspaces {
+		for _, candidate := range candidates {
+			if err := ensureSingleWorkspaceLayout(candidate.Branch, "cleanup", selection.Workspaces[0], candidate.Targets[0]); err != nil {
+				return 1, err
+			}
+		}
+	}
+	fmt.Fprint(options.Stdout, renderCleanupPlan(selection, candidates, parsed.DryRun))
+	if parsed.DryRun {
+		return 0, nil
+	}
+	for _, candidate := range candidates {
+		for index, target := range candidate.Targets {
+			logCleanupProgress(options.Stdout, selection.Workspaces[index], candidate.Branch, "checking clean worktree")
+			if err := git.EnsureCleanWorktree(ctx, target, options.Runner); err != nil {
+				return 1, fmt.Errorf("%s: %s: %w", candidate.Branch, selection.Workspaces[index].Name, err)
+			}
+		}
+	}
+	if !parsed.Yes {
+		confirmed, err := confirmCleanup(options.Stdin, options.Stdout, len(candidates))
+		if err != nil {
+			return 1, err
+		}
+		if !confirmed {
+			fmt.Fprintln(options.Stdout, "cleanup cancelled")
+			return 0, nil
+		}
+	}
+	for _, candidate := range candidates {
+		for index, target := range candidate.Targets {
+			logCleanupProgress(options.Stdout, selection.Workspaces[index], candidate.Branch, "cleaning generated workspace env")
+			if err := removeGeneratedContextEnv(selection.Workspaces[index], target.WorktreePath); err != nil {
+				return 1, fmt.Errorf("%s: %s: %w", candidate.Branch, selection.Workspaces[index].Name, err)
+			}
+		}
+		logCleanupProgress(options.Stdout, workspaceSpec{}, candidate.Branch, "closing tmux targets")
+		if err := killWorkspaceTmux(ctx, selection, candidate.Branch, options); err != nil {
+			return 1, fmt.Errorf("%s: %w", candidate.Branch, err)
+		}
+		for index, target := range candidate.Targets {
+			logCleanupProgress(options.Stdout, selection.Workspaces[index], candidate.Branch, "removing git worktree")
+			if err := git.RemoveWorktreePath(ctx, target, false, options.Runner); err != nil {
+				return 1, fmt.Errorf("%s: %s: %w", candidate.Branch, selection.Workspaces[index].Name, err)
+			}
+			logCleanupProgress(options.Stdout, selection.Workspaces[index], candidate.Branch, "deleting local branch")
+			if err := git.DeleteBranch(ctx, target, false, options.Runner); err != nil {
+				return 1, fmt.Errorf("%s: %s: %w", candidate.Branch, selection.Workspaces[index].Name, err)
+			}
+		}
+		fmt.Fprintf(options.Stdout, "removed %s\n", candidate.Branch)
+	}
+	fmt.Fprintf(options.Stdout, "cleanup: removed %d branch(es)\n", len(candidates))
 	return 0, nil
 }
 
@@ -444,6 +526,12 @@ type listArgs struct {
 	PullRequests bool
 }
 
+type cleanupArgs struct {
+	DryRun     bool
+	Yes        bool
+	Workspaces bool
+}
+
 func parseListArgs(args []string) (listArgs, error) {
 	parsed := listArgs{}
 	for _, arg := range args {
@@ -452,6 +540,23 @@ func parseListArgs(args []string) (listArgs, error) {
 			parsed.PullRequests = true
 		default:
 			return listArgs{}, fmt.Errorf("usage: wktree list [--pr]")
+		}
+	}
+	return parsed, nil
+}
+
+func parseCleanupArgs(args []string) (cleanupArgs, error) {
+	parsed := cleanupArgs{}
+	for _, arg := range args {
+		switch arg {
+		case "--dry-run":
+			parsed.DryRun = true
+		case "--yes", "-y":
+			parsed.Yes = true
+		case "--workspaces":
+			parsed.Workspaces = true
+		default:
+			return cleanupArgs{}, fmt.Errorf("usage: wktree cleanup [--dry-run] [--yes] [--workspaces]")
 		}
 	}
 	return parsed, nil
@@ -511,10 +616,8 @@ func parseCloseArgs(args []string) (closeArgs, error) {
 
 func renderRemoveDryRun(selection workspaceSelection, branch string, targets []git.RemoveTarget, force bool) string {
 	worktreeRemove := "git worktree remove"
-	branchDelete := "git branch -d"
 	if force {
 		worktreeRemove = "git worktree remove --force"
-		branchDelete = "git branch -D"
 	}
 
 	var output strings.Builder
@@ -532,7 +635,7 @@ func renderRemoveDryRun(selection workspaceSelection, branch string, targets []g
 	}
 	for _, target := range targets {
 		fmt.Fprintf(&output, "  %s %s\n", worktreeRemove, target.WorktreePath)
-		fmt.Fprintf(&output, "  %s %s\n", branchDelete, target.Branch)
+		fmt.Fprintf(&output, "  %s %s\n", branchDeleteCommand(force, target), target.Branch)
 	}
 	return output.String()
 }
@@ -554,8 +657,112 @@ func renderCloseDryRun(selection workspaceSelection, branch string, targets []gi
 	return output.String()
 }
 
+type cleanupCandidate struct {
+	Branch  string
+	Targets []git.RemoveTarget
+}
+
+func resolveCleanupCandidates(ctx context.Context, selection workspaceSelection, options Options) ([]cleanupCandidate, error) {
+	targetsByWorkspace := make([]map[string]git.RemoveTarget, 0, len(selection.Workspaces))
+	branchSet := map[string]bool{}
+	for _, workspace := range selection.Workspaces {
+		targets, err := git.ResolveCleanupTargets(ctx, workspace.RepoRoot, options.Runner)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", workspace.Name, err)
+		}
+		byBranch := map[string]git.RemoveTarget{}
+		for _, target := range targets {
+			byBranch[target.Branch] = target
+			branchSet[target.Branch] = true
+		}
+		targetsByWorkspace = append(targetsByWorkspace, byBranch)
+	}
+
+	branches := make([]string, 0, len(branchSet))
+	for branch := range branchSet {
+		branches = append(branches, branch)
+	}
+	sort.Strings(branches)
+
+	candidates := []cleanupCandidate{}
+	for _, branch := range branches {
+		targets := make([]git.RemoveTarget, 0, len(selection.Workspaces))
+		for _, byBranch := range targetsByWorkspace {
+			target, ok := byBranch[branch]
+			if selection.AllWorkspaces && !ok {
+				targets = nil
+				break
+			}
+			if ok {
+				targets = append(targets, target)
+			}
+		}
+		if len(targets) == 0 {
+			continue
+		}
+		candidates = append(candidates, cleanupCandidate{Branch: branch, Targets: targets})
+	}
+	return candidates, nil
+}
+
+func renderCleanupPlan(selection workspaceSelection, candidates []cleanupCandidate, dryRun bool) string {
+	var output strings.Builder
+	if dryRun {
+		fmt.Fprintln(&output, "dry run: cleanup")
+	} else {
+		fmt.Fprintln(&output, "cleanup will remove merged worktree branches:")
+	}
+	fmt.Fprintf(&output, "tmux mode: %s\n", effectiveTmuxMode(selection))
+	for _, candidate := range candidates {
+		fmt.Fprintf(&output, "branch: %s\n", candidate.Branch)
+		for index, target := range candidate.Targets {
+			workspace := selection.Workspaces[index]
+			fmt.Fprintf(&output, "  workspace: %s\n", workspace.Name)
+			fmt.Fprintf(&output, "    worktree: %s\n", target.WorktreePath)
+		}
+	}
+	fmt.Fprintln(&output, "actions:")
+	for _, candidate := range candidates {
+		for _, action := range tmuxRemovalActions(selection, candidate.Branch) {
+			fmt.Fprintf(&output, "  %s\n", action)
+		}
+		for _, target := range candidate.Targets {
+			fmt.Fprintf(&output, "  git worktree remove %s\n", target.WorktreePath)
+			fmt.Fprintf(&output, "  %s %s\n", branchDeleteCommand(false, target), target.Branch)
+		}
+	}
+	return output.String()
+}
+
+func confirmCleanup(reader io.Reader, writer io.Writer, count int) (bool, error) {
+	if reader == nil {
+		reader = os.Stdin
+	}
+	fmt.Fprintf(writer, "Remove %d merged worktree branch(es)? Type 'yes' to continue: ", count)
+	line, err := bufio.NewReader(reader).ReadString('\n')
+	if err != nil && err != io.EOF {
+		return false, err
+	}
+	return strings.TrimSpace(line) == "yes", nil
+}
+
 func logRemoveProgress(writer io.Writer, workspace workspaceSpec, message string) {
 	logCommandProgress(writer, "remove", workspace, message)
+}
+
+func logCleanupProgress(writer io.Writer, workspace workspaceSpec, branch string, message string) {
+	if workspace.Name == "" {
+		fmt.Fprintf(writer, "cleanup: %s: %s\n", branch, message)
+		return
+	}
+	fmt.Fprintf(writer, "cleanup: %s: %s: %s\n", branch, workspace.Name, message)
+}
+
+func branchDeleteCommand(force bool, target git.RemoveTarget) string {
+	if force || target.ForceDelete {
+		return "git branch -D"
+	}
+	return "git branch -d"
 }
 
 func logCommandProgress(writer io.Writer, command string, workspace workspaceSpec, message string) {
@@ -1290,6 +1497,7 @@ Usage:
   wktree init
   wktree doctor
   wktree list [--pr]
+  wktree cleanup [--dry-run] [--yes] [--workspaces]
   wktree new [--home <path>] [--from <ref>] [--workspaces] <branch>
   wktree close [--dry-run] [--workspaces] <branch>
   wktree remove [--force] [--dry-run] [--workspaces] <branch>
@@ -1303,6 +1511,7 @@ Examples:
   wktree doctor
   wktree list
   wktree list --pr
+  wktree cleanup --dry-run
   wktree new feature/example
   wktree new --from main feature/example
   wktree new --workspaces feature/example
@@ -1332,6 +1541,9 @@ func normalizeOptions(options Options) Options {
 	}
 	if options.Env == nil {
 		options.Env = envMap(os.Environ())
+	}
+	if options.Stdin == nil {
+		options.Stdin = os.Stdin
 	}
 	if options.Stdout == nil {
 		options.Stdout = os.Stdout

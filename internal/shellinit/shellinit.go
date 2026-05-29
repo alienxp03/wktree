@@ -24,7 +24,7 @@ _wktree_completion() {
   local -a __wktree_values
 
   if (( CURRENT == 2 )); then
-    __wktree_values=(doctor list new close remove switch init completion)
+    __wktree_values=(doctor list cleanup new close remove switch init completion)
     _describe 'command' __wktree_values
     return
   fi
@@ -47,7 +47,7 @@ _wktree_completion() {
   __wktree_cur="${COMP_WORDS[COMP_CWORD]}"
 
   if [ "$COMP_CWORD" -eq 1 ]; then
-    COMPREPLY=( $(compgen -W "doctor list new close remove switch init completion" -- "$__wktree_cur") )
+    COMPREPLY=( $(compgen -W "doctor list cleanup new close remove switch init completion" -- "$__wktree_cur") )
     return 0
   fi
 

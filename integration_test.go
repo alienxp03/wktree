@@ -478,6 +478,90 @@ func TestWktreeRemoveDeletesWorktreeAndBranch(t *testing.T) {
 	}
 }
 
+func TestWktreeCleanupConfirmsAndRemovesMergedWorktrees(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	env := testEnv(t, repo.root)
+	sourceBranch := git(t, []string{"branch", "--show-current"}, repo.sourceRoot)
+
+	result := runWktree(t, binary, []string{"new", "--home", repo.worktreeHome, "feature/cleanup"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("new cleanup status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	mergedPath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-cleanup")
+
+	git(t, []string{"checkout", "-b", "feature/unmerged"}, repo.sourceRoot)
+	write(t, filepath.Join(repo.sourceRoot, "unmerged.txt"), "unmerged\n")
+	git(t, []string{"add", "unmerged.txt"}, repo.sourceRoot)
+	git(t, []string{"commit", "-m", "Unmerged cleanup commit"}, repo.sourceRoot)
+	git(t, []string{"checkout", sourceBranch}, repo.sourceRoot)
+	result = runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "feature/unmerged"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("switch unmerged status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	unmergedPath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-unmerged")
+
+	result = runWktree(t, binary, []string{"cleanup", "--dry-run"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("cleanup dry-run status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	for _, want := range []string{"dry run: cleanup", "branch: feature/cleanup", "git worktree remove", "git branch -d feature/cleanup"} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("cleanup dry-run output missing %q:\n%s", want, result.stdout)
+		}
+	}
+	if strings.Contains(result.stdout, "feature/unmerged") {
+		t.Fatalf("cleanup dry-run should not include unmerged branch:\n%s", result.stdout)
+	}
+
+	result = runWktreeWithInput(t, binary, []string{"cleanup"}, repo.sourceRoot, env, "no\n")
+	if result.exitCode != 0 || !strings.Contains(result.stdout, "cleanup cancelled") {
+		t.Fatalf("cleanup cancel status=%d stdout=%s stderr=%s", result.exitCode, result.stdout, result.stderr)
+	}
+	if _, err := os.Stat(mergedPath); err != nil {
+		t.Fatalf("expected cancelled cleanup to keep worktree, stat err=%v", err)
+	}
+	if got := git(t, []string{"branch", "--list", "feature/cleanup"}, repo.sourceRoot); !strings.Contains(got, "feature/cleanup") {
+		t.Fatalf("expected cancelled cleanup to keep branch, branch list=%q", got)
+	}
+
+	result = runWktreeWithInput(t, binary, []string{"cleanup"}, repo.sourceRoot, env, "yes\n")
+	if result.exitCode != 0 {
+		t.Fatalf("cleanup status=%d stdout=%s stderr=%s", result.exitCode, result.stdout, result.stderr)
+	}
+	for _, want := range []string{
+		"Remove 1 merged worktree branch(es)? Type 'yes' to continue:",
+		"cleanup: feature/cleanup: alienxp03/demo: removing git worktree",
+		"cleanup: feature/cleanup: alienxp03/demo: deleting local branch",
+		"removed feature/cleanup",
+		"cleanup: removed 1 branch(es)",
+	} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("cleanup output missing %q:\n%s", want, result.stdout)
+		}
+	}
+	if _, err := os.Stat(mergedPath); !os.IsNotExist(err) {
+		t.Fatalf("expected merged worktree removed, stat err=%v", err)
+	}
+	if got := git(t, []string{"branch", "--list", "feature/cleanup"}, repo.sourceRoot); got != "" {
+		t.Fatalf("merged branch still exists: %q", got)
+	}
+	if _, err := os.Stat(unmergedPath); err != nil {
+		t.Fatalf("expected unmerged worktree to remain, stat err=%v", err)
+	}
+	if got := git(t, []string{"branch", "--list", "feature/unmerged"}, repo.sourceRoot); !strings.Contains(got, "feature/unmerged") {
+		t.Fatalf("expected unmerged branch to remain: %q", got)
+	}
+
+	result = runWktree(t, binary, []string{"cleanup", "--dry-run"}, unmergedPath, env)
+	if result.exitCode != 0 {
+		t.Fatalf("cleanup from linked worktree status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	if strings.Contains(result.stdout, "branch: "+sourceBranch) {
+		t.Fatalf("cleanup from linked worktree should not offer to remove primary worktree branch:\n%s", result.stdout)
+	}
+}
+
 func TestWktreeCloseKeepsWorktreeAndBranch(t *testing.T) {
 	binary := buildBinary(t)
 	repo := createTempRepo(t)
@@ -576,6 +660,50 @@ func TestWktreeRemoveForceDeletesUnmergedBranch(t *testing.T) {
 		t.Fatalf("expected worktree removed, stat err=%v", err)
 	}
 	if got := git(t, []string{"branch", "--list", "feature/unmerged"}, repo.sourceRoot); got != "" {
+		t.Fatalf("branch still exists: %q", got)
+	}
+}
+
+func TestWktreeRemoveDeletesGitHubMergedPullRequestBranch(t *testing.T) {
+	binary := buildBinary(t)
+	repo := createTempRepo(t)
+	env := testEnv(t, repo.root)
+	sourceBranch := git(t, []string{"branch", "--show-current"}, repo.sourceRoot)
+
+	git(t, []string{"checkout", "-b", "feature/squash"}, repo.sourceRoot)
+	write(t, filepath.Join(repo.sourceRoot, "squash.txt"), "from branch\n")
+	git(t, []string{"add", "squash.txt"}, repo.sourceRoot)
+	git(t, []string{"commit", "-m", "Feature squash commit"}, repo.sourceRoot)
+	branchHead := git(t, []string{"rev-parse", "HEAD"}, repo.sourceRoot)
+	git(t, []string{"checkout", sourceBranch}, repo.sourceRoot)
+	write(t, filepath.Join(repo.sourceRoot, "squash.txt"), "from branch\n")
+	git(t, []string{"add", "squash.txt"}, repo.sourceRoot)
+	git(t, []string{"commit", "-m", "Squash merge feature"}, repo.sourceRoot)
+	mergeHead := git(t, []string{"rev-parse", "HEAD"}, repo.sourceRoot)
+
+	result := runWktree(t, binary, []string{"switch", "--home", repo.worktreeHome, "feature/squash"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("switch status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	worktreePath := filepath.Join(repo.worktreeHome, "alienxp03", "demo", "feature-squash")
+	writeFakeGhList(t, env, fmt.Sprintf(`[{"headRefName":"feature/squash","headRefOid":%q,"mergeCommit":{"oid":%q}}]`, branchHead, mergeHead))
+
+	result = runWktree(t, binary, []string{"remove", "--dry-run", "feature/squash"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("dry-run remove status=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	if !strings.Contains(result.stdout, "git branch -D feature/squash") {
+		t.Fatalf("dry-run should show force branch delete for PR-merged branch:\n%s", result.stdout)
+	}
+
+	result = runWktree(t, binary, []string{"remove", "feature/squash"}, repo.sourceRoot, env)
+	if result.exitCode != 0 {
+		t.Fatalf("remove status=%d stdout=%s stderr=%s", result.exitCode, result.stdout, result.stderr)
+	}
+	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
+		t.Fatalf("expected worktree removed, stat err=%v", err)
+	}
+	if got := git(t, []string{"branch", "--list", "feature/squash"}, repo.sourceRoot); got != "" {
 		t.Fatalf("branch still exists: %q", got)
 	}
 }
@@ -1179,10 +1307,17 @@ type commandResult struct {
 }
 
 func runWktree(t *testing.T, binary string, args []string, cwd string, env []string) commandResult {
+	return runWktreeWithInput(t, binary, args, cwd, env, "")
+}
+
+func runWktreeWithInput(t *testing.T, binary string, args []string, cwd string, env []string, stdin string) commandResult {
 	t.Helper()
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = cwd
 	cmd.Env = env
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
 	stdout, stderr := strings.Builder{}, strings.Builder{}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
