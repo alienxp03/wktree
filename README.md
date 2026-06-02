@@ -203,5 +203,5 @@ make lint test                    # lint and test
 
 - **`tmux window mode requires running inside tmux`** — start tmux first or use `tmux_mode: session`.
 - **`gh is required for --pr`** — install and authenticate the [GitHub CLI](https://cli.github.com/).
-- **`branch is not merged`** — merge first, or use `--force`.
+- **`branch is not merged`** — merge first, check whether the local branch has commits beyond the merged PR head, or use `--force`.
 - **`wktree doctor`** — run this first when something looks wrong.

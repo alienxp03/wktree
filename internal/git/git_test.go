@@ -123,6 +123,8 @@ func TestPullRequestMergedForBranchRejectsChangedHead(t *testing.T) {
 			return run.Result{Stdout: "abc123\n"}
 		case "gh pr list --head feature/squash --state merged --limit 20 --json headRefName,headRefOid,mergeCommit":
 			return run.Result{Stdout: `[{"headRefName":"feature/squash","headRefOid":"changed","mergeCommit":{"oid":"def456"}}]`}
+		case "git merge-base --is-ancestor abc123 changed":
+			return run.Result{ExitCode: 1}
 		default:
 			t.Fatalf("unexpected command: %s %v", command, args)
 			return run.Result{ExitCode: 1}
@@ -133,6 +135,59 @@ func TestPullRequestMergedForBranchRejectsChangedHead(t *testing.T) {
 	}
 	if got {
 		t.Fatal("expected changed PR head to be rejected")
+	}
+}
+
+func TestPullRequestMergedForBranchAcceptsLocalHeadContainedInMergedPRHead(t *testing.T) {
+	got, err := PullRequestMergedForBranch(context.Background(), "/repo", "feature/squash", run.RunnerFunc(func(_ context.Context, command string, args []string, _ run.Options) run.Result {
+		switch command + " " + strings.Join(args, " ") {
+		case "git rev-parse --verify feature/squash^{commit}":
+			return run.Result{Stdout: "abc123\n"}
+		case "gh pr list --head feature/squash --state merged --limit 20 --json headRefName,headRefOid,mergeCommit":
+			return run.Result{Stdout: `[{"headRefName":"feature/squash","headRefOid":"def456","mergeCommit":{"oid":"fedcba"}}]`}
+		case "git merge-base --is-ancestor abc123 def456":
+			return run.Result{ExitCode: 0}
+		case "git merge-base --is-ancestor fedcba HEAD":
+			return run.Result{ExitCode: 0}
+		default:
+			t.Fatalf("unexpected command: %s %v", command, args)
+			return run.Result{ExitCode: 1}
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got {
+		t.Fatal("expected local branch head contained in merged PR head to be accepted")
+	}
+}
+
+func TestBranchRemovalStatusExplainsMergedPRHeadMismatch(t *testing.T) {
+	status, err := branchRemovalStatus(context.Background(), "/repo", "feature/squash", run.RunnerFunc(func(_ context.Context, command string, args []string, _ run.Options) run.Result {
+		switch command + " " + strings.Join(args, " ") {
+		case "git merge-base --is-ancestor feature/squash HEAD":
+			return run.Result{ExitCode: 1}
+		case "git rev-parse --verify feature/squash^{commit}":
+			return run.Result{Stdout: "abc123456789\n"}
+		case "gh pr list --head feature/squash --state merged --limit 20 --json headRefName,headRefOid,mergeCommit":
+			return run.Result{Stdout: `[{"headRefName":"feature/squash","headRefOid":"def456789012","mergeCommit":{"oid":"fedcba"}}]`}
+		case "git merge-base --is-ancestor abc123456789 def456789012":
+			return run.Result{ExitCode: 1}
+		default:
+			t.Fatalf("unexpected command: %s %v", command, args)
+			return run.Result{ExitCode: 1}
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Merged {
+		t.Fatal("expected changed PR head to remain unmerged")
+	}
+	for _, want := range []string{"GitHub has a merged PR at", "def4567", "abc1234"} {
+		if !strings.Contains(status.Reason, want) {
+			t.Fatalf("reason missing %q: %q", want, status.Reason)
+		}
 	}
 }
 

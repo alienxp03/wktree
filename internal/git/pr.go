@@ -97,34 +97,50 @@ func PullRequestURLsByBranch(ctx context.Context, repoRoot string, branches []st
 }
 
 func PullRequestMergedForBranch(ctx context.Context, repoRoot string, branch string, runner run.Runner) (bool, error) {
+	merged, _, err := pullRequestMergedForBranch(ctx, repoRoot, branch, runner)
+	return merged, err
+}
+
+func pullRequestMergedForBranch(ctx context.Context, repoRoot string, branch string, runner run.Runner) (bool, string, error) {
 	if runner == nil {
 		runner = run.DefaultRunner{}
 	}
 	branch = strings.TrimSpace(branch)
 	if branch == "" {
-		return false, nil
+		return false, "", nil
 	}
 	headOID, err := branchOID(ctx, repoRoot, branch, runner)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 
 	args := []string{"pr", "list", "--head", branch, "--state", "merged", "--limit", "20", "--json", "headRefName,headRefOid,mergeCommit"}
 	result := runner.Run(ctx, "gh", args, run.Options{Cwd: repoRoot})
 	if result.Err != nil || result.ExitCode != 0 {
-		return false, fmt.Errorf("gh is required for merged PR lookup: %s", run.FailureMessage("gh", args, result))
+		return false, "", fmt.Errorf("gh is required for merged PR lookup: %s", run.FailureMessage("gh", args, result))
 	}
 
 	var items []mergedPullRequestListItem
 	if err := json.Unmarshal([]byte(result.Stdout), &items); err != nil {
-		return false, fmt.Errorf("failed to parse gh pr list output: %w", err)
+		return false, "", fmt.Errorf("failed to parse gh pr list output: %w", err)
 	}
+	var mergedPRHeadOID string
 	for _, item := range items {
 		if strings.TrimSpace(item.HeadRefName) != branch {
 			continue
 		}
-		if !strings.EqualFold(strings.TrimSpace(item.HeadRefOID), headOID) {
-			continue
+		itemHeadOID := strings.TrimSpace(item.HeadRefOID)
+		if !strings.EqualFold(itemHeadOID, headOID) {
+			localHeadInPR, err := commitMerged(ctx, repoRoot, headOID, itemHeadOID, runner)
+			if err != nil {
+				return false, "", err
+			}
+			if !localHeadInPR {
+				if mergedPRHeadOID == "" {
+					mergedPRHeadOID = itemHeadOID
+				}
+				continue
+			}
 		}
 		mergeOID := strings.TrimSpace(item.MergeCommit.OID)
 		if mergeOID == "" {
@@ -132,13 +148,24 @@ func PullRequestMergedForBranch(ctx context.Context, repoRoot string, branch str
 		}
 		merged, err := commitMerged(ctx, repoRoot, mergeOID, "HEAD", runner)
 		if err != nil {
-			return false, err
+			return false, "", err
 		}
 		if merged {
-			return true, nil
+			return true, "", nil
 		}
 	}
-	return false, nil
+	if mergedPRHeadOID != "" {
+		return false, fmt.Sprintf("branch is not merged into current HEAD: %s (GitHub has a merged PR at %s, but the local branch is at %s)", branch, shortOID(mergedPRHeadOID), shortOID(headOID)), nil
+	}
+	return false, "", nil
+}
+
+func shortOID(oid string) string {
+	oid = strings.TrimSpace(oid)
+	if len(oid) <= 7 {
+		return oid
+	}
+	return oid[:7]
 }
 
 func ResolvePullRequestWorktree(ctx context.Context, options PullRequestOptions) (PullRequestTarget, error) {

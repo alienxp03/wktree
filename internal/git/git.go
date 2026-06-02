@@ -374,7 +374,10 @@ func ResolveRemoveTarget(ctx context.Context, options RemoveOptions) (RemoveTarg
 			return RemoveTarget{}, err
 		}
 		if !status.Merged {
-			return RemoveTarget{}, fmt.Errorf("branch is not merged into current HEAD: %s", branch)
+			if status.Reason != "" {
+				return RemoveTarget{}, errors.New(status.Reason)
+			}
+			return RemoveTarget{}, unmergedBranchError(branch)
 		}
 		target.ForceDelete = status.ForceDelete
 	}
@@ -646,7 +649,10 @@ func ensureBranchMerged(ctx context.Context, repoRoot string, branch string, run
 		return err
 	}
 	if !status.Merged {
-		return fmt.Errorf("branch is not merged into current HEAD: %s", branch)
+		if status.Reason != "" {
+			return errors.New(status.Reason)
+		}
+		return unmergedBranchError(branch)
 	}
 	return nil
 }
@@ -654,6 +660,7 @@ func ensureBranchMerged(ctx context.Context, repoRoot string, branch string, run
 type branchRemovalMergeStatus struct {
 	Merged      bool
 	ForceDelete bool
+	Reason      string
 }
 
 func branchRemovalStatus(ctx context.Context, repoRoot string, branch string, runner run.Runner) (branchRemovalMergeStatus, error) {
@@ -664,14 +671,18 @@ func branchRemovalStatus(ctx context.Context, repoRoot string, branch string, ru
 	if merged {
 		return branchRemovalMergeStatus{Merged: true}, nil
 	}
-	mergedPR, err := PullRequestMergedForBranch(ctx, repoRoot, branch, runner)
+	mergedPR, reason, err := pullRequestMergedForBranch(ctx, repoRoot, branch, runner)
 	if err != nil {
 		return branchRemovalMergeStatus{}, nil
 	}
 	if mergedPR {
 		return branchRemovalMergeStatus{Merged: true, ForceDelete: true}, nil
 	}
-	return branchRemovalMergeStatus{}, nil
+	return branchRemovalMergeStatus{Reason: reason}, nil
+}
+
+func unmergedBranchError(branch string) error {
+	return fmt.Errorf("branch is not merged into current HEAD: %s", branch)
 }
 
 func BranchMerged(ctx context.Context, repoRoot string, branch string, runner run.Runner) (bool, error) {
