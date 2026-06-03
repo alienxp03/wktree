@@ -22,7 +22,7 @@ var unsafeEnvNameChars = regexp.MustCompile(`[^A-Za-z0-9]+`)
 
 type Config struct {
 	WorktreeDir   string      `yaml:"worktree_dir"`
-	TmuxMode      string      `yaml:"tmux_mode"`
+	Tmux          Tmux        `yaml:"tmux"`
 	WorkspaceMode string      `yaml:"workspace_mode"`
 	Defaults      Defaults    `yaml:"defaults"`
 	Workspaces    []Workspace `yaml:"workspaces"`
@@ -34,6 +34,11 @@ type Config struct {
 
 type Defaults struct {
 	Files Files `yaml:"files"`
+}
+
+type Tmux struct {
+	Mode        string `yaml:"mode"`
+	SessionName string `yaml:"session_name"`
 }
 
 type Workspace struct {
@@ -88,7 +93,9 @@ func ProjectTemplate() string {
 # Cleanup needs no config; preview with: wktree cleanup --dry-run
 
 # worktree_dir: ~/workspace/worktrees
-# tmux_mode: window
+# tmux:
+#   mode: window
+#   session_name: "${repo}/${branch}"
 # workspace_mode: single
 
 workspaces:
@@ -196,8 +203,8 @@ func LoadProjectFile(configPath string, homeDir string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	if config.TmuxMode == "" {
-		config.TmuxMode = DefaultTmuxMode
+	if config.Tmux.Mode == "" {
+		config.Tmux.Mode = DefaultTmuxMode
 	}
 	if config.WorkspaceMode == "" {
 		config.WorkspaceMode = DefaultWorkspaceMode
@@ -277,11 +284,11 @@ func WorkspacePanes(workspace Workspace) []PaneCommand {
 }
 
 func validateConfig(config *Config, filePath string, homeDir string) error {
-	if config.TmuxMode == "" {
-		config.TmuxMode = DefaultTmuxMode
+	if config.Tmux.Mode == "" {
+		config.Tmux.Mode = DefaultTmuxMode
 	}
-	if config.TmuxMode != "window" && config.TmuxMode != "session" {
-		return fmt.Errorf("invalid config in %s: tmux_mode must be \"window\" or \"session\"", filePath)
+	if config.Tmux.Mode != "window" && config.Tmux.Mode != "session" {
+		return fmt.Errorf("invalid config in %s: tmux.mode must be \"window\" or \"session\"", filePath)
 	}
 	if config.WorkspaceMode == "" {
 		config.WorkspaceMode = DefaultWorkspaceMode
@@ -293,6 +300,9 @@ func validateConfig(config *Config, filePath string, homeDir string) error {
 		if _, err := expandPath(config.WorktreeDir, homeDir, filepath.Dir(filePath)); err != nil {
 			return fmt.Errorf("invalid config in %s: worktree_dir %w", filePath, err)
 		}
+	}
+	if err := validateTmuxSessionName(config.Tmux.SessionName); err != nil {
+		return fmt.Errorf("invalid config in %s: tmux.session_name %w", filePath, err)
 	}
 	if hasFiles(config.Defaults.Files) && hasFiles(config.Files) {
 		return fmt.Errorf("invalid config in %s: use defaults.files or files, not both", filePath)
@@ -395,6 +405,45 @@ func validatePaneCommand(command PaneCommand, label string, filePath string) err
 	return nil
 }
 
+func validateTmuxSessionName(template string) error {
+	remaining := template
+	for {
+		start := strings.Index(remaining, "${")
+		if start < 0 {
+			return nil
+		}
+		afterStart := remaining[start+2:]
+		end := strings.Index(afterStart, "}")
+		if end < 0 {
+			return fmt.Errorf("has unterminated template reference")
+		}
+		reference := afterStart[:end]
+		if !isTmuxSessionNameReference(reference) {
+			return fmt.Errorf("uses unknown template reference %q", reference)
+		}
+		remaining = afterStart[end+1:]
+	}
+}
+
+func isTmuxSessionNameReference(reference string) bool {
+	if reference == "repo" || reference == "branch" || reference == "dir" {
+		return true
+	}
+	if !strings.HasPrefix(reference, "dir:") {
+		return false
+	}
+	index := strings.TrimPrefix(reference, "dir:")
+	if index == "" {
+		return false
+	}
+	for _, char := range index {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func validateFiles(files Files, label string, filePath string) error {
 	if err := validateSetupPaths(files.Copy, label+".copy", filePath); err != nil {
 		return err
@@ -441,12 +490,9 @@ func validateSetEnv(setEnv []SetEnv, key string, filePath string) error {
 		if len(item.Vars) == 0 {
 			return fmt.Errorf("invalid config in %s: %s.vars must define at least one variable", filePath, label)
 		}
-		for name, value := range item.Vars {
+		for name := range item.Vars {
 			if !isEnvVarName(name) {
 				return fmt.Errorf("invalid config in %s: %s.vars key %q must be a valid env var name", filePath, label, name)
-			}
-			if strings.TrimSpace(value) == "" {
-				return fmt.Errorf("invalid config in %s: %s.vars.%s must be a non-empty string", filePath, label, name)
 			}
 		}
 	}
@@ -510,13 +556,18 @@ func validateNode(node *yaml.Node, filePath string) error {
 	for i := 0; i < len(node.Content); i += 2 {
 		key := node.Content[i].Value
 		switch key {
-		case "worktree_dir", "tmux_mode", "workspace_mode", "defaults", "workspaces", "files", "hooks":
+		case "worktree_dir", "tmux", "workspace_mode", "defaults", "workspaces", "files", "hooks":
+			if key == "tmux" {
+				if err := validateTmuxNode(node.Content[i+1], filePath); err != nil {
+					return err
+				}
+			}
 			if key == "defaults" {
 				if err := validateDefaultsNode(node.Content[i+1], filePath); err != nil {
 					return err
 				}
 			}
-		case "copy", "symlink", "postSetup", "windows", "mode", "default_workspaces":
+		case "copy", "symlink", "postSetup", "windows", "mode", "tmux_mode", "tmux_session_name", "default_workspaces":
 			return fmt.Errorf("invalid config in %s: legacy key %q is not supported", filePath, key)
 		default:
 			return fmt.Errorf("invalid config in %s: unsupported key %q", filePath, key)
@@ -537,6 +588,21 @@ func validateDefaultsNode(node *yaml.Node, filePath string) error {
 			return fmt.Errorf("invalid config in %s: defaults.hooks is not supported; use workspaces[].hooks", filePath)
 		default:
 			return fmt.Errorf("invalid config in %s: unsupported defaults key %q", filePath, key)
+		}
+	}
+	return nil
+}
+
+func validateTmuxNode(node *yaml.Node, filePath string) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("invalid config in %s: tmux must be an object", filePath)
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		key := node.Content[i].Value
+		switch key {
+		case "mode", "session_name":
+		default:
+			return fmt.Errorf("invalid config in %s: unsupported tmux key %q", filePath, key)
 		}
 	}
 	return nil

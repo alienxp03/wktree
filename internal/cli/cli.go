@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/alienxp03/wktree/internal/config"
@@ -299,7 +300,7 @@ func runDoctor(ctx context.Context, args []string, options Options) (int, error)
 		status = 1
 	} else {
 		fmt.Fprintf(options.Stdout, "[ok] project config path: %s\n", selection.ConfigPath)
-		fmt.Fprintf(options.Stdout, "[ok] config: tmux_mode=%s workspace_mode=%s workspaces=%d\n", selection.Config.TmuxMode, selection.Config.WorkspaceMode, len(selection.Workspaces))
+		fmt.Fprintf(options.Stdout, "[ok] config: tmux.mode=%s workspace_mode=%s workspaces=%d\n", selection.Config.Tmux.Mode, selection.Config.WorkspaceMode, len(selection.Workspaces))
 	}
 
 	if err := tmux.Available(ctx, options.Runner); err != nil {
@@ -1207,7 +1208,7 @@ func effectiveTmuxMode(selection workspaceSelection) string {
 	if selection.AllWorkspaces {
 		return tmux.ModeSession
 	}
-	return selection.Config.TmuxMode
+	return selection.Config.Tmux.Mode
 }
 
 func workspaceWindowNames(selection workspaceSelection) []string {
@@ -1227,7 +1228,75 @@ func sessionName(selection workspaceSelection, branch string) string {
 	if err != nil {
 		branchSlug = "branch"
 	}
-	return tmux.TargetName(selection.ConfigRepoSlug) + "/" + tmux.TargetName(branchSlug)
+	repoName := tmux.TargetName(selection.ConfigRepoSlug)
+	branchName := tmux.TargetName(branchSlug)
+	if strings.TrimSpace(selection.Config.Tmux.SessionName) == "" {
+		return repoName + "/" + branchName
+	}
+	name := renderTmuxSessionName(selection.Config.Tmux.SessionName, selection.ConfigDir, repoName, branchName)
+	return tmuxSessionTargetName(name)
+}
+
+func renderTmuxSessionName(template string, configDir string, repoName string, branchName string) string {
+	remaining := template
+	var output strings.Builder
+	for {
+		start := strings.Index(remaining, "${")
+		if start < 0 {
+			output.WriteString(remaining)
+			return output.String()
+		}
+		output.WriteString(remaining[:start])
+		afterStart := remaining[start+2:]
+		end := strings.Index(afterStart, "}")
+		if end < 0 {
+			output.WriteString(remaining[start:])
+			return output.String()
+		}
+		reference := afterStart[:end]
+		switch {
+		case reference == "repo":
+			output.WriteString(repoName)
+		case reference == "branch":
+			output.WriteString(branchName)
+		case reference == "dir":
+			output.WriteString(tmuxDirName(configDir, 0))
+		case strings.HasPrefix(reference, "dir:"):
+			depth, err := strconv.Atoi(strings.TrimPrefix(reference, "dir:"))
+			if err != nil {
+				output.WriteString("${")
+				output.WriteString(reference)
+				output.WriteString("}")
+			} else {
+				output.WriteString(tmuxDirName(configDir, depth))
+			}
+		default:
+			output.WriteString("${")
+			output.WriteString(reference)
+			output.WriteString("}")
+		}
+		remaining = afterStart[end+1:]
+	}
+}
+
+func tmuxDirName(configDir string, depth int) string {
+	dir := filepath.Clean(configDir)
+	for index := 0; index < depth; index++ {
+		next := filepath.Dir(dir)
+		if next == dir {
+			break
+		}
+		dir = next
+	}
+	return tmux.TargetName(filepath.Base(dir))
+}
+
+func tmuxSessionTargetName(value string) string {
+	parts := strings.Split(value, "/")
+	for index, part := range parts {
+		parts[index] = tmux.TargetName(part)
+	}
+	return strings.Join(parts, "/")
 }
 
 type worktreeArgs struct {
@@ -1525,7 +1594,7 @@ Examples:
 Setup config:
   Create:  wktree init
   Project: nearest .wktree.yaml
-  Keys:    worktree_dir, tmux_mode, workspace_mode, defaults, workspaces, panes, files, hooks, set_env, open
+  Keys:    worktree_dir, tmux, workspace_mode, defaults, workspaces, panes, files, hooks, set_env, open
 
 Shell integration:
   eval "$(wktree completion zsh)"

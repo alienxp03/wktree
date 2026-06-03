@@ -22,14 +22,14 @@ func TestProjectTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.WorktreeDir != "" || loaded.TmuxMode != "window" || loaded.WorkspaceMode != "single" {
+	if loaded.WorktreeDir != "" || loaded.Tmux.Mode != "window" || loaded.WorkspaceMode != "single" {
 		t.Fatalf("config = %#v", loaded)
 	}
 	if len(loaded.Workspaces) != 1 || loaded.Workspaces[0].Name != "window_name" || loaded.Workspaces[0].Repo != "." {
 		t.Fatalf("workspaces = %#v", loaded.Workspaces)
 	}
 	template := ProjectTemplate()
-	for _, want := range []string{"# worktree_dir: ~/workspace/worktrees", "# tmux_mode: window", "# workspace_mode: single", "# files:", "# hooks:", "#   post_create:", "# randomize_ports:", "#       - PORT", "# set_env:", "#       API_URL:", "# open:", "# panes:"} {
+	for _, want := range []string{"# worktree_dir: ~/workspace/worktrees", "# tmux:", "#   mode: window", "#   session_name: \"${repo}/${branch}\"", "# workspace_mode: single", "# files:", "# hooks:", "#   post_create:", "# randomize_ports:", "#       - PORT", "# set_env:", "#       API_URL:", "# open:", "# panes:"} {
 		if !strings.Contains(template, want) {
 			t.Fatalf("template missing %q:\n%s", want, template)
 		}
@@ -93,7 +93,8 @@ func TestLoadProjectConfig(t *testing.T) {
 	must(t, os.MkdirAll(sourceRoot, 0o755))
 	write(t, filepath.Join(sourceRoot, ".wktree.yaml"), strings.Join([]string{
 		"worktree_dir: ~/worktree",
-		"tmux_mode: session",
+		"tmux:",
+		"  mode: session",
 		"workspace_mode: all",
 		"defaults:",
 		"  files:",
@@ -134,7 +135,7 @@ func TestLoadProjectConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.WorktreeDir != "~/worktree" || config.TmuxMode != "session" || config.WorkspaceMode != "all" {
+	if config.WorktreeDir != "~/worktree" || config.Tmux.Mode != "session" || config.WorkspaceMode != "all" {
 		t.Fatalf("config = %#v", config)
 	}
 	if len(config.Workspaces) != 2 || config.Workspaces[0].Name != "backend" || config.Workspaces[1].Repo != "../frontend" {
@@ -233,6 +234,9 @@ func TestLoadFileRejectsInvalidConfig(t *testing.T) {
 	bothDefaultFiles := filepath.Join(root, "both-default-files.yaml")
 	defaultHooks := filepath.Join(root, "default-hooks.yaml")
 	badTmuxMode := filepath.Join(root, "bad-tmux-mode.yaml")
+	badTmuxSessionNameReference := filepath.Join(root, "bad-tmux-session-name-reference.yaml")
+	badTmuxSessionNameSyntax := filepath.Join(root, "bad-tmux-session-name-syntax.yaml")
+	badTmuxKey := filepath.Join(root, "bad-tmux-key.yaml")
 	badWorkspaceMode := filepath.Join(root, "bad-workspace-mode.yaml")
 	badSplit := filepath.Join(root, "bad-split.yaml")
 	unsafeCopy := filepath.Join(root, "unsafe-copy.yaml")
@@ -259,7 +263,10 @@ func TestLoadFileRejectsInvalidConfig(t *testing.T) {
 	write(t, bothPaneKeys, "workspaces:\n  - name: app\n    panes:\n      - command: nvim\n    commands:\n      - command: codex\n")
 	write(t, bothDefaultFiles, "defaults:\n  files:\n    copy:\n      - .env\nfiles:\n  copy:\n    - .env.local\n")
 	write(t, defaultHooks, "defaults:\n  hooks:\n    post_create:\n      - pnpm install\n")
-	write(t, badTmuxMode, "tmux_mode: pane\n")
+	write(t, badTmuxMode, "tmux:\n  mode: pane\n")
+	write(t, badTmuxSessionNameReference, "tmux:\n  session_name: ${workspace}\n")
+	write(t, badTmuxSessionNameSyntax, "tmux:\n  session_name: ${branch\n")
+	write(t, badTmuxKey, "tmux:\n  name: app\n")
 	write(t, badWorkspaceMode, "workspace_mode: many\n")
 	write(t, badSplit, "workspaces:\n  - name: app\n    panes:\n      - command: nvim\n        split: diagonal\n")
 	write(t, unsafeCopy, "defaults:\n  files:\n    copy:\n      - ../.env\n")
@@ -286,7 +293,10 @@ func TestLoadFileRejectsInvalidConfig(t *testing.T) {
 	loadErrorContains(t, bothPaneKeys, "panes or commands")
 	loadErrorContains(t, bothDefaultFiles, "defaults.files or files")
 	loadErrorContains(t, defaultHooks, "defaults.hooks is not supported")
-	loadErrorContains(t, badTmuxMode, "tmux_mode")
+	loadErrorContains(t, badTmuxMode, "tmux.mode")
+	loadErrorContains(t, badTmuxSessionNameReference, "tmux.session_name")
+	loadErrorContains(t, badTmuxSessionNameSyntax, "tmux.session_name")
+	loadErrorContains(t, badTmuxKey, "unsupported tmux key")
 	loadErrorContains(t, badWorkspaceMode, "workspace_mode")
 	loadErrorContains(t, badSplit, "split")
 	loadErrorContains(t, unsafeCopy, `cannot contain ".."`)
@@ -297,7 +307,9 @@ func TestLoadFileRejectsInvalidConfig(t *testing.T) {
 	loadErrorContains(t, unsafeSetEnvFile, `cannot contain ".."`)
 	loadErrorContains(t, emptySetEnvVars, "must define at least one variable")
 	loadErrorContains(t, badSetEnvVar, "valid env var name")
-	loadErrorContains(t, emptySetEnvTemplate, "must be a non-empty string")
+	if _, err := LoadFile(emptySetEnvTemplate, filepath.Join(root, "home")); err != nil {
+		t.Fatalf("empty set_env value should be valid: %v", err)
+	}
 	loadErrorContains(t, emptyOpen, "must be a non-empty string")
 }
 

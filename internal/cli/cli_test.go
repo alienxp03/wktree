@@ -53,6 +53,39 @@ func TestCompletion(t *testing.T) {
 	}
 }
 
+func TestSessionNameUsesTemplate(t *testing.T) {
+	selection := workspaceSelection{
+		Config: config.Config{
+			Tmux: config.Tmux{SessionName: "sideview/${branch}"},
+		},
+		ConfigDir:      "/Users/stan/workspace/mmb-tools/apps/sideview",
+		ConfigRepoSlug: "loveholidays/sideview",
+	}
+
+	if got := sessionName(selection, "feature/example"); got != "sideview/feature-example" {
+		t.Fatalf("session name = %q", got)
+	}
+
+	selection.Config.Tmux.SessionName = ""
+	if got := sessionName(selection, "feature/example"); got != "loveholidays-sideview/feature-example" {
+		t.Fatalf("default session name = %q", got)
+	}
+}
+
+func TestSessionNameUsesDirectoryTemplate(t *testing.T) {
+	selection := workspaceSelection{
+		Config: config.Config{
+			Tmux: config.Tmux{SessionName: "${dir:2}-${dir}/${branch}"},
+		},
+		ConfigDir:      "/Users/stan/workspace/mmb-tools/apps/sideview",
+		ConfigRepoSlug: "loveholidays/sideview",
+	}
+
+	if got := sessionName(selection, "main"); got != "mmb-tools-sideview/main" {
+		t.Fatalf("session name = %q", got)
+	}
+}
+
 func TestInvalidNewUsage(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	status := Run([]string{"new"}, Options{Stdout: &bytes.Buffer{}, Stderr: stderr})
@@ -200,7 +233,7 @@ func TestWorkspaceWindowNameUsesWorkspaceName(t *testing.T) {
 
 func TestEffectiveTmuxModeForcesSessionForAllWorkspaces(t *testing.T) {
 	selection := workspaceSelection{
-		Config:        config.Config{TmuxMode: tmux.ModeWindow},
+		Config:        config.Config{Tmux: config.Tmux{Mode: tmux.ModeWindow}},
 		AllWorkspaces: true,
 	}
 	if got := effectiveTmuxMode(selection); got != tmux.ModeSession {

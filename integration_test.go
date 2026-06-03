@@ -116,7 +116,8 @@ func TestWktreeSwitchCreatesAndReusesExistingBranchWorktree(t *testing.T) {
 	git(t, []string{"checkout", sourceBranch}, repo.sourceRoot)
 
 	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
-		"tmux_mode: window",
+		"tmux:",
+		"  mode: window",
 		"workspaces:",
 		"  - name: app",
 		"    hooks:",
@@ -140,7 +141,8 @@ func TestWktreeSwitchCreatesAndReusesExistingBranchWorktree(t *testing.T) {
 	}
 
 	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
-		"tmux_mode: window",
+		"tmux:",
+		"  mode: window",
 		"workspaces:",
 		"  - name: app",
 		"    hooks:",
@@ -396,7 +398,7 @@ func TestWktreeInitCreatesProjectConfig(t *testing.T) {
 		t.Fatalf("stdout = %q", result.stdout)
 	}
 	config := read(t, configPath)
-	for _, want := range []string{"# worktree_dir: ~/workspace/worktrees", "# tmux_mode: window", "# workspace_mode: single", "# randomize_ports:", "#       - PORT", "name: window_name", "repo: ."} {
+	for _, want := range []string{"# worktree_dir: ~/workspace/worktrees", "# tmux:", "#   mode: window", "#   session_name: \"${repo}/${branch}\"", "# workspace_mode: single", "# randomize_ports:", "#       - PORT", "name: window_name", "repo: ."} {
 		if !strings.Contains(config, want) {
 			t.Fatalf("config missing %q:\n%s", want, config)
 		}
@@ -734,7 +736,8 @@ func TestWktreeNewAndRemoveWorkspaces(t *testing.T) {
 	env := testEnv(t, repo.root)
 	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
 		"worktree_dir: " + repo.worktreeHome,
-		"tmux_mode: window",
+		"tmux:",
+		"  mode: window",
 		"workspace_mode: all",
 		"workspaces:",
 		"  - name: backend",
@@ -825,7 +828,8 @@ func TestWktreeRemoveRequiresWorkspacesForMultiWorkspaceEnv(t *testing.T) {
 	env := testEnv(t, repo.root)
 	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
 		"worktree_dir: " + repo.worktreeHome,
-		"tmux_mode: window",
+		"tmux:",
+		"  mode: window",
 		"workspaces:",
 		"  - name: backend",
 		"  - name: frontend",
@@ -1102,7 +1106,8 @@ func TestWktreeNewAppliesSetupConfig(t *testing.T) {
 	write(t, filepath.Join(repo.sourceRoot, ".env.local"), "PROJECT_ENV=1\nPORT=3000\nAPP_PORT=3001\n")
 	write(t, filepath.Join(repo.sourceRoot, ".tool-versions"), "go 1.26.1\n")
 	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
-		"tmux_mode: window",
+		"tmux:",
+		"  mode: window",
 		"defaults:",
 		"  files:",
 		"    copy:",
@@ -1167,7 +1172,8 @@ func TestFailingPostCreateLeavesWorktreeIntact(t *testing.T) {
 	repo := createTempRepo(t)
 	env := testEnv(t, repo.root)
 	write(t, filepath.Join(repo.sourceRoot, ".wktree.yaml"), strings.Join([]string{
-		"tmux_mode: window",
+		"tmux:",
+		"  mode: window",
 		"workspaces:",
 		"  - name: app",
 		"    hooks:",

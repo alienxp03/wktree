@@ -40,7 +40,9 @@ Creates `.wktree.yaml` in the current directory. `wktree` searches from cwd up t
 
 ```yaml
 worktree_dir: ~/worktree
-tmux_mode: window
+tmux:
+  mode: window
+  session_name: "${repo}/${branch}"
 workspace_mode: single
 
 workspaces:
@@ -126,10 +128,13 @@ workspaces:
 | Key | Description |
 |-----|-------------|
 | `worktree_dir` | Where worktrees are stored. Default `~/workspace/worktrees`. |
-| `tmux_mode` | `window` (default) creates a tmux window in the current session. `session` creates a new session. |
+| `tmux.mode` | `window` (default) creates a tmux window in the current session. `session` creates a new session. |
+| `tmux.session_name` | Tmux session name template. Supports `${repo}`, `${branch}`, `${dir}`, and `${dir:N}`. Default `${repo}/${branch}`. |
 | `workspace_mode` | `single` uses the first workspace unless `--workspaces` is passed. `all` uses every workspace by default. |
 | `defaults` | Shared config applied to every workspace before workspace-level config. |
 | `workspaces` | Ordered list of workspaces. |
+
+`${dir}` is the directory containing `.wktree.yaml`; `${dir:1}` is its parent, `${dir:2}` is the next parent, and so on.
 
 ### Workspace
 
@@ -201,7 +206,7 @@ make lint test                    # lint and test
 
 ## Troubleshooting
 
-- **`tmux window mode requires running inside tmux`** — start tmux first or use `tmux_mode: session`.
+- **`tmux window mode requires running inside tmux`** — start tmux first or use `tmux.mode: session`.
 - **`gh is required for --pr`** — install and authenticate the [GitHub CLI](https://cli.github.com/).
 - **`branch is not merged`** — merge first, check whether the local branch has commits beyond the merged PR head, or use `--force`.
 - **`wktree doctor`** — run this first when something looks wrong.
