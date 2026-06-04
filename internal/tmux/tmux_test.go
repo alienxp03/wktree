@@ -32,6 +32,12 @@ func TestWindowName(t *testing.T) {
 	}
 }
 
+func TestTargetNameKeepsEmoji(t *testing.T) {
+	if got := TargetName("🌲 loveholidays/aurora:main"); got != "🌲-loveholidays-aurora-main" {
+		t.Fatalf("TargetName = %q", got)
+	}
+}
+
 func TestVisibleCommand(t *testing.T) {
 	command := VisibleCommand("/tmp/worktree", "pnpm install")
 	for _, want := range []string{"$ pnpm install", ". '/tmp/worktree/.wktree.env'", "eval 'pnpm install'", "wktree_status=$?", "pane command failed", "exec \"${SHELL:-/bin/sh}\" -i"} {

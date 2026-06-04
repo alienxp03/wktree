@@ -56,7 +56,7 @@ func TestCompletion(t *testing.T) {
 func TestSessionNameUsesTemplate(t *testing.T) {
 	selection := workspaceSelection{
 		Config: config.Config{
-			Tmux: config.Tmux{SessionName: "sideview/${branch}"},
+			Tmux: config.Tmux{SessionName: "${repo}/${branch}"},
 		},
 		ConfigDir:      "/Users/stan/workspace/mmb-tools/apps/sideview",
 		ConfigRepoSlug: "loveholidays/sideview",
@@ -67,8 +67,21 @@ func TestSessionNameUsesTemplate(t *testing.T) {
 	}
 
 	selection.Config.Tmux.SessionName = ""
-	if got := sessionName(selection, "feature/example"); got != "loveholidays-sideview/feature-example" {
+	if got := sessionName(selection, "feature/example"); got != "sideview/feature-example" {
 		t.Fatalf("default session name = %q", got)
+	}
+}
+
+func TestSessionNameUsesOwnerTemplate(t *testing.T) {
+	selection := workspaceSelection{
+		Config: config.Config{
+			Tmux: config.Tmux{SessionName: "${owner}-${repo}/${branch}"},
+		},
+		ConfigRepoSlug: "loveholidays/sideview",
+	}
+
+	if got := sessionName(selection, "feature/example"); got != "loveholidays-sideview/feature-example" {
+		t.Fatalf("session name = %q", got)
 	}
 }
 

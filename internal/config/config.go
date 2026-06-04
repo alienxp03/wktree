@@ -426,7 +426,7 @@ func validateTmuxSessionName(template string) error {
 }
 
 func isTmuxSessionNameReference(reference string) bool {
-	if reference == "repo" || reference == "branch" || reference == "dir" {
+	if reference == "owner" || reference == "repo" || reference == "branch" || reference == "dir" {
 		return true
 	}
 	if !strings.HasPrefix(reference, "dir:") {

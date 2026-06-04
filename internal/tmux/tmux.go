@@ -18,7 +18,7 @@ const (
 	ModeSession = "session"
 )
 
-var unsafeNameChars = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
+var unsafeNameChars = regexp.MustCompile(`[^\pL\pM\pN\pS_.-]+`)
 
 type LayoutOptions struct {
 	Mode        string

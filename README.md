@@ -129,7 +129,7 @@ workspaces:
 |-----|-------------|
 | `worktree_dir` | Where worktrees are stored. Default `~/workspace/worktrees`. |
 | `tmux.mode` | `window` (default) creates a tmux window in the current session. `session` creates a new session. |
-| `tmux.session_name` | Tmux session name template. Supports `${repo}`, `${branch}`, `${dir}`, and `${dir:N}`. Default `${repo}/${branch}`. |
+| `tmux.session_name` | Tmux session name template. Supports `${owner}`, `${repo}`, `${branch}`, `${dir}`, and `${dir:N}`. Default `${repo}/${branch}`. |
 | `workspace_mode` | `single` uses the first workspace unless `--workspaces` is passed. `all` uses every workspace by default. |
 | `defaults` | Shared config applied to every workspace before workspace-level config. |
 | `workspaces` | Ordered list of workspaces. |

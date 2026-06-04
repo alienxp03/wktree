@@ -1228,16 +1228,26 @@ func sessionName(selection workspaceSelection, branch string) string {
 	if err != nil {
 		branchSlug = "branch"
 	}
-	repoName := tmux.TargetName(selection.ConfigRepoSlug)
+	ownerName, repoName := repoSlugParts(selection.ConfigRepoSlug)
 	branchName := tmux.TargetName(branchSlug)
 	if strings.TrimSpace(selection.Config.Tmux.SessionName) == "" {
 		return repoName + "/" + branchName
 	}
-	name := renderTmuxSessionName(selection.Config.Tmux.SessionName, selection.ConfigDir, repoName, branchName)
+	name := renderTmuxSessionName(selection.Config.Tmux.SessionName, selection.ConfigDir, ownerName, repoName, branchName)
 	return tmuxSessionTargetName(name)
 }
 
-func renderTmuxSessionName(template string, configDir string, repoName string, branchName string) string {
+func repoSlugParts(repoSlug string) (string, string) {
+	cleaned := filepath.Clean(repoSlug)
+	repo := tmux.TargetName(filepath.Base(cleaned))
+	owner := tmux.TargetName(filepath.Base(filepath.Dir(cleaned)))
+	if owner == "." || owner == string(filepath.Separator) {
+		owner = "wktree"
+	}
+	return owner, repo
+}
+
+func renderTmuxSessionName(template string, configDir string, ownerName string, repoName string, branchName string) string {
 	remaining := template
 	var output strings.Builder
 	for {
@@ -1255,6 +1265,8 @@ func renderTmuxSessionName(template string, configDir string, repoName string, b
 		}
 		reference := afterStart[:end]
 		switch {
+		case reference == "owner":
+			output.WriteString(ownerName)
 		case reference == "repo":
 			output.WriteString(repoName)
 		case reference == "branch":
